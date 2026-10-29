@@ -78,15 +78,16 @@ GRE Manager — это TUI в одном файле на Python + `dialog`, уд
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y python3 iproute2 dialog iptables iputils-ping procps
+sudo apt-get install -y python3 iproute2 dialog iptables iputils-ping procps curl
 ```
 
 ### Новая установка
 
 ```bash
-git clone https://github.com/sysinahell/gre-manager.git
-cd gre-manager
-sudo install -m 0755 gre-manager.py /usr/local/sbin/gre-manager
+# скачать последнюю версию и установить
+curl -fsSL -o /tmp/gre-manager.py \
+    https://raw.githubusercontent.com/sysinahell/gre-manager/main/gre-manager.py
+sudo install -m 0755 /tmp/gre-manager.py /usr/local/sbin/gre-manager
 
 # установить systemd-юниты
 sudo gre-manager init
@@ -98,23 +99,37 @@ sudo gre-manager audit
 sudo gre-manager
 ```
 
-### Обновление с v1.4
+Вместо `curl` можно взять код через git: `git clone https://github.com/sysinahell/gre-manager.git` и установить `gre-manager.py` из этой папки той же командой `install`.
+
+### Обновление
 
 ```bash
-# бэкап профилей и старой версии скрипта
-sudo gre-manager backup /root/gre-before-v15.zip
-sudo cp -a /usr/local/sbin/gre-manager /root/gre-manager.v1.4.bak
+# 1. бэкап профилей и текущей версии скрипта
+sudo gre-manager backup /root/gre-before-update.zip
+sudo cp -a /usr/local/sbin/gre-manager /root/gre-manager.bak
 
-# установка новой версии
-sudo install -m 0755 gre-manager.py /usr/local/sbin/gre-manager
+# 2. скачать новую версию и заменить старую
+curl -fsSL -o /tmp/gre-manager.py \
+    https://raw.githubusercontent.com/sysinahell/gre-manager/main/gre-manager.py
+sudo install -m 0755 /tmp/gre-manager.py /usr/local/sbin/gre-manager
+
+# 3. обновить systemd-юниты и проверить хост
 sudo gre-manager init
 sudo gre-manager audit
 ```
 
+Если ставили через git — вместо шага 2 выполните `git pull` в папке репозитория и `sudo install -m 0755 gre-manager.py /usr/local/sbin/gre-manager`.
+
+Откат на предыдущую версию:
+
+```bash
+sudo install -m 0755 /root/gre-manager.bak /usr/local/sbin/gre-manager
+```
+
 > [!NOTE]
-> После обновления нужно выполнить `init`: он создаёт опциональный, **выключенный по умолчанию** `gre-manager-input-acl.service`. `init` не запускает и не перезапускает GRE и не перезаписывает `gre-manager@.service`, если тот отличается от известного шаблона.
+> `init` после обновления обязателен: с v1.5 он создаёт опциональный, **выключенный по умолчанию** `gre-manager-input-acl.service`. `init` не запускает и не перезапускает GRE и не перезаписывает `gre-manager@.service`, если тот отличается от известного шаблона.
 >
-> Для замены Python-файла **перезапуск GRE не нужен**. Существующие профили остаются `firewall_mode=legacy`, пока их явно не переключат. Бэкапы v1.2–v1.4 читаются.
+> Для замены скрипта **перезапуск GRE не нужен**. Профили, созданные до v1.5, остаются `firewall_mode=legacy`, пока их явно не переключат. Бэкапы v1.2–v1.4 читаются.
 
 ## 🧭 Новый GRE до MikroTik
 

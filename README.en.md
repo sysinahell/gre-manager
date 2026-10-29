@@ -78,15 +78,16 @@ Requires Python 3, `dialog`, `iproute2`, systemd and `iptables` (legacy or iptab
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y python3 iproute2 dialog iptables iputils-ping procps
+sudo apt-get install -y python3 iproute2 dialog iptables iputils-ping procps curl
 ```
 
 ### Fresh install
 
 ```bash
-git clone https://github.com/sysinahell/gre-manager.git
-cd gre-manager
-sudo install -m 0755 gre-manager.py /usr/local/sbin/gre-manager
+# download the latest version and install it
+curl -fsSL -o /tmp/gre-manager.py \
+    https://raw.githubusercontent.com/sysinahell/gre-manager/main/gre-manager.py
+sudo install -m 0755 /tmp/gre-manager.py /usr/local/sbin/gre-manager
 
 # install systemd units
 sudo gre-manager init
@@ -98,23 +99,37 @@ sudo gre-manager audit
 sudo gre-manager
 ```
 
-### Upgrade from v1.4
+Instead of `curl` you can use git: `git clone https://github.com/sysinahell/gre-manager.git`, then install `gre-manager.py` from that folder with the same `install` command.
+
+### Update
 
 ```bash
-# back up profiles and the old script
-sudo gre-manager backup /root/gre-before-v15.zip
-sudo cp -a /usr/local/sbin/gre-manager /root/gre-manager.v1.4.bak
+# 1. back up profiles and the current script
+sudo gre-manager backup /root/gre-before-update.zip
+sudo cp -a /usr/local/sbin/gre-manager /root/gre-manager.bak
 
-# install the new version
-sudo install -m 0755 gre-manager.py /usr/local/sbin/gre-manager
+# 2. download the new version and replace the old one
+curl -fsSL -o /tmp/gre-manager.py \
+    https://raw.githubusercontent.com/sysinahell/gre-manager/main/gre-manager.py
+sudo install -m 0755 /tmp/gre-manager.py /usr/local/sbin/gre-manager
+
+# 3. refresh systemd units and check the host
 sudo gre-manager init
 sudo gre-manager audit
 ```
 
+If you installed via git, replace step 2 with `git pull` in the repository folder and `sudo install -m 0755 gre-manager.py /usr/local/sbin/gre-manager`.
+
+Roll back to the previous version:
+
+```bash
+sudo install -m 0755 /root/gre-manager.bak /usr/local/sbin/gre-manager
+```
+
 > [!NOTE]
-> `init` is required after upgrading: it creates the optional, **disabled-by-default** `gre-manager-input-acl.service`. It doesn't start or restart any GRE, and it won't overwrite a `gre-manager@.service` that differs from the known template.
+> Run `init` after every update: since v1.5 it creates the optional, **disabled-by-default** `gre-manager-input-acl.service`. It doesn't start or restart any GRE and won't overwrite a `gre-manager@.service` that differs from the known template.
 >
-> Replacing the Python file needs **no GRE restart**. Existing profiles stay `firewall_mode=legacy` until switched explicitly. Backups from v1.2–v1.4 remain readable.
+> Replacing the script needs **no GRE restart**. Profiles created before v1.5 stay `firewall_mode=legacy` until switched explicitly. Backups from v1.2–v1.4 remain readable.
 
 ## 🧭 New GRE to MikroTik
 
