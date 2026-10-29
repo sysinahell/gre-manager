@@ -9,6 +9,7 @@
 [![Platform](https://img.shields.io/badge/platform-Debian%20%7C%20Ubuntu-A81D33.svg?logo=debian&logoColor=white)](#-установка)
 [![Tests](https://img.shields.io/badge/unit%20tests-42-success.svg)](test_gre_manager.py)
 [![MikroTik](https://img.shields.io/badge/peer-MikroTik%20RouterOS-293239.svg)](#-пример-новый-gre-до-mikrotik)
+[![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 
 [English](README.md) · **Русский**
 
@@ -30,6 +31,7 @@ GRE Manager — это TUI в одном файле на Python + `dialog`, уд
 - [Восстановление и миграция IP](#-восстановление-на-другой-сервер-и-массовая-смена-локального-ipv4)
 - [Безопасность и ограничения](#-безопасность-и-ограничения)
 - [Тестирование](#-тестирование)
+- [Лицензия](#-лицензия)
 
 ## ✨ Возможности
 
@@ -240,3 +242,7 @@ python3 -m unittest -v test_gre_manager.py
 | `/etc/sysctl.d/90-gre-manager-forward.conf` | Постоянный IPv4 forwarding |
 | `/run/gre-manager/` | Состояние во время работы, применённые правила firewall |
 | `/var/backups/gre-manager/` | Автоматические бэкапы перед изменениями |
+
+## 📄 Лицензия
+
+[MIT](LICENSE) © sysinahell
