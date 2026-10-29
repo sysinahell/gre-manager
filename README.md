@@ -8,7 +8,7 @@
 [![Status](https://img.shields.io/badge/status-pre--production-orange.svg)](#-safety--limitations)
 [![Python](https://img.shields.io/badge/python-3.x-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/platform-Debian%20%7C%20Ubuntu-A81D33.svg?logo=debian&logoColor=white)](#-installation)
-[![Tests](https://img.shields.io/badge/unit%20tests-57-success.svg)](#-testing)
+[![Tests](https://img.shields.io/badge/unit%20tests-62-success.svg)](#-testing)
 [![MikroTik](https://img.shields.io/badge/peer-MikroTik%20RouterOS-293239.svg)](#-new-gre-to-mikrotik)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 
@@ -57,7 +57,7 @@ Requires Python 3, `dialog`, `iproute2`, systemd and `iptables` (legacy or iptab
 | 📦 **Bulk operations** | NAT and security mode for all or selected tunnels |
 | 💾 **Backup / restore** | ZIP backups, automatic pre-change snapshots |
 | ⚙️ **systemd** | One `gre-manager@<tunnel>.service` per tunnel, optional autostart |
-| 📟 **MikroTik hints** | Ready-to-paste RouterOS commands for the peer side |
+| 📟 **MikroTik scripts** | Full RouterOS 6 / 7 config: GRE, routing table, mangle, address list, NAT |
 
 ## 🆕 What's new in v1.5
 
@@ -133,6 +133,27 @@ Typical topology: LAN → **source NAT on MikroTik to the GRE inner IP** → GRE
 
 > [!IMPORTANT]
 > Keep the route to the server's **public underlay IP** outside the tunnel. RouterOS isn't configured automatically — `sudo gre-manager peer gre1` prints suggested commands.
+
+### Full MikroTik script (RouterOS 6 / 7)
+
+TUI: tunnel menu → `Generate full MikroTik script`. The result can be printed as plain text for mouse copy (no dialog borders), sent straight to your local clipboard via OSC 52 (Windows Terminal, iTerm2, kitty, WezTerm; tmux needs `set -g set-clipboard on`), saved as `.rsc` or viewed in a window. Or use the CLI:
+
+```bash
+sudo gre-manager mikrotik gre1 --ros 7 --clients 192.168.88.10,192.168.88.0/24
+sudo gre-manager mikrotik gre1 --ros 6 --clients 192.168.88.10 -o /root/gre1.rsc
+```
+
+The script creates the GRE interface (keepalive off, MTU from the profile), its `/30` address, a separate routing table (`/routing table` on v7, `routing-mark` on v6) with a default route via the server's inner IP and `check-gateway=ping`, a client address list plus a bypass list for private networks, mangle (connection mark → routing mark, MSS clamp), masquerade into the tunnel and excludes marked connections from FastTrack. Only listed clients go through GRE; the router itself and the public GRE endpoint stay on the main table.
+
+| Option | Meaning |
+|---|---|
+| `--ros 6\|7` | RouterOS version (default 7) |
+| `--clients` | IPs / CIDRs routed into the tunnel |
+| `--server-ip` | Server public IPv4, if the server is behind NAT |
+| `--fallback` | No kill switch: clients use the main WAN while GRE is down |
+| `-o FILE` | Save as `.rsc` for `/import` |
+
+Every object is tagged `comment="gre-manager:<tunnel>"`; uninstall commands are at the end of the script.
 
 ## 🛡️ Firewall modes
 
@@ -257,6 +278,7 @@ sudo gre-manager audit                             # read-only firewall / addres
 sudo gre-manager pool [NEW_POOL_CIDR]              # show/change /30 allocation pool
 sudo gre-manager allocate [POOL_CIDR]              # preview next free /30
 sudo gre-manager peer TUNNEL                       # RouterOS instructions
+sudo gre-manager mikrotik TUNNEL [--ros 6|7] [--clients IPs] [--server-ip IPv4] [--fallback] [-o FILE]
 sudo gre-manager internet TUNNEL [--enable|--disable] [--wan WAN] [--sources CIDRs] [--commit] [--apply]
 sudo gre-manager bulk-internet --enable|--disable --all|--tunnels A,B [--wan WAN] [--commit] [--apply]
 sudo gre-manager bulk-security --mode MODE --all|--tunnels A,B [--commit] [--apply]
@@ -303,7 +325,7 @@ python3 -m py_compile gre-manager.py
 sudo python3 -m unittest -v test_gre_manager.py test_v15.py
 ```
 
-57 unit tests based on mocks / fixtures for iproute2, iptables and systemd. CLI tests need root (`sudo`). Live network-namespace / integration tests have **not** been run.
+62 unit tests based on mocks / fixtures for iproute2, iptables and systemd. CLI tests need root (`sudo`). Live network-namespace / integration tests have **not** been run.
 
 ## 📂 Files
 

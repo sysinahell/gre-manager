@@ -7,6 +7,7 @@ are managed. Requires: Python 3, iproute2, systemd, dialog (for UI).
 """
 
 import argparse
+import base64
 import copy
 import datetime as dt
 import hashlib
@@ -1827,6 +1828,7 @@ def tunnel_ui(name):
             ("9", "Ping inner GRE peer"),
             ("10", "Internet via server: NAT / allowed client networks"),
             ("11", "MikroTik configuration / peer address"),
+            ("12", "Generate full MikroTik script (RouterOS 6 / 7)"),
         ])
         if choice is None:
             return
@@ -1863,6 +1865,8 @@ def tunnel_ui(name):
             internet_ui(name)
         elif choice == "11":
             textbox(f"MikroTik setup: {name}", mikrotik_notes(c))
+        elif choice == "12":
+            mikrotik_ui(c)
         elif choice == "8":
             if confirm("PERMANENTLY delete this GRE config?\n"
                        "The tunnel will be stopped and disabled first.",
@@ -2071,7 +2075,163 @@ def mikrotik_notes(c):
             f"WAN: {c['internet']['wan'] or '(not set)'}\n"
             f"Allowed NAT sources: {', '.join(c['internet']['sources']) or '(none)'}\n"
             f"Missing client LAN routes: {', '.join(missing_client_routes(c)) or '(none)'}\n"
-            "New GRE profiles set up NAT and LAN routes during creation.\n")
+            "New GRE profiles set up NAT and LAN routes during creation.\n\n"
+            f"Full RouterOS 6/7 script: sudo gre-manager mikrotik {c['name']} --ros 7\n")
+
+
+ROUTEROS_BYPASS = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+
+
+def routeros_config(c, ros=7, clients=(), server_ip="", fallback=False):
+    """RouterOS 6/7 script: GRE, address, srcnat, routing table, mangle, lists.
+
+    Selected clients (address list) are policy-routed into the tunnel and
+    masqueraded to the MikroTik inner GRE IP, so the server only has to allow
+    that /32. Router-originated GRE packets are never marked, which keeps the
+    public endpoint on the main table and avoids a routing loop.
+    """
+    if ros not in (6, 7):
+        raise GreError("RouterOS version must be 6 or 7")
+    peer = peer_address(c)
+    if not peer:
+        raise GreError("Full MikroTik config requires a /30 GRE link address")
+    server_ip = ip4(server_ip or c["local"], "Server public IPv4")
+    inner = str(ipaddress.IPv4Interface(c["address"]).ip)
+    entries = []
+    for value in clients:
+        try:
+            net = ipaddress.IPv4Network(str(value).strip(), strict=False)
+        except ValueError as e:
+            raise GreError(f"Client address/CIDR: {e}") from e
+        entries.append(str(net.network_address) if net.prefixlen == 32 else str(net))
+    name = c["name"]
+    iface, table = f"gre-{name}", f"via-gre-{name}"
+    clients_list, bypass_list = f"gre-{name}-clients", f"gre-{name}-bypass"
+    tag = f"gre-manager:{name}"
+    mark = "routing-table" if ros == 7 else "routing-mark"
+    out = [f"# GRE Manager v{VERSION}: MikroTik RouterOS {ros} config for tunnel '{name}'",
+           f"# Server underlay {server_ip} | server GRE {inner} | MikroTik GRE {peer}/30",
+           f"# Paste into the terminal or save as {iface}.rsc and run: /import {iface}.rsc",
+           f"# Everything is tagged comment=\"{tag}\" (see the uninstall block at the end)."]
+    warnings = []
+    if any(ipaddress.IPv4Address(server_ip) in ipaddress.IPv4Network(n)
+           for n in ROUTEROS_BYPASS + ("100.64.0.0/10",)):
+        warnings.append(f"Server IP {server_ip} is private: if the server is behind NAT, "
+                        "regenerate with --server-ip PUBLIC_IP.")
+    if c["key"]:
+        warnings.append(f"Server uses GRE key {c['key']}; RouterOS GRE has no key option, "
+                        "remove the key on the server or the tunnel will not pass traffic.")
+    if not c["internet"]["enabled"]:
+        warnings.append("Server NAT is DISABLED for this tunnel: enable it "
+                        f"(gre-manager internet {name} --enable ...) for Internet access.")
+    elif peer + "/32" not in c["internet"]["sources"]:
+        warnings.append(f"Server NAT sources do not include {peer}/32 used by this script.")
+    if not entries:
+        warnings.append(f"No clients given: add addresses to list {clients_list} "
+                        "(see the commented example below).")
+    out += [f"# WARNING: {w}" for w in warnings]
+    out += ["", "/interface gre",
+            f"add name={iface} remote-address={server_ip} mtu={c['mtu']} "
+            f"allow-fast-path=no comment=\"{tag}\"",
+            # Linux answers keepalives via FORWARD, which isolated mode drops.
+            f"set [find name={iface}] !keepalive",
+            "", "/ip address",
+            f"add address={peer}/30 interface={iface} comment=\"{tag}\""]
+    if ros == 7:
+        out += ["", "/routing table", f"add name={table} fib comment=\"{tag}\""]
+    out += ["", "/ip route",
+            f"add dst-address=0.0.0.0/0 gateway={inner} {mark}={table} "
+            f"check-gateway=ping comment=\"{tag}\""]
+    if not fallback:
+        blackhole = "blackhole" if ros == 7 else "type=blackhole"
+        out.append(f"add dst-address=0.0.0.0/0 {blackhole} distance=250 {mark}={table} "
+                    f"comment=\"{tag}: kill switch, clients stay offline while GRE is down\"")
+    out += ["", "/ip firewall address-list"]
+    out += [f"add list={bypass_list} address={n} comment=\"{tag}\"" for n in ROUTEROS_BYPASS]
+    out += [f"add list={clients_list} address={a} comment=\"{tag}\"" for a in entries]
+    if not entries:
+        out.append(f"# add list={clients_list} address=192.168.88.10 comment=\"{tag}\"")
+    out += ["", "/ip firewall mangle",
+            f"add chain=prerouting in-interface=!{iface} src-address-list={clients_list} "
+            f"dst-address-list=!{bypass_list} dst-address-type=!local connection-state=new "
+            f"connection-mark=no-mark action=mark-connection new-connection-mark={iface} "
+            f"passthrough=yes comment=\"{tag}\"",
+            f"add chain=prerouting in-interface=!{iface} connection-mark={iface} "
+            f"action=mark-routing new-routing-mark={table} passthrough=no comment=\"{tag}\"",
+            f"add chain=forward out-interface={iface} protocol=tcp tcp-flags=syn "
+            f"action=change-mss new-mss=clamp-to-pmtu passthrough=yes comment=\"{tag}\"",
+            "", "/ip firewall nat",
+            f"add chain=srcnat out-interface={iface} action=masquerade comment=\"{tag}\"",
+            "", "/ip firewall filter",
+            "# GRE from the server is accepted as established (MikroTik pings first).",
+            "# FastTrack would bypass mangle for marked connections:",
+            "set [find action=fasttrack-connection] connection-mark=no-mark",
+            "", "# Uninstall:"]
+    menus = ["/ip firewall nat", "/ip firewall mangle",
+             "/ip firewall address-list", "/ip route", "/ip address", "/interface gre"]
+    if ros == 7:
+        menus.insert(4, "/routing table")
+    out += [f"# {m} remove [find comment~\"{tag}\"]" for m in menus]
+    return "\n".join(out) + "\n"
+
+
+def mikrotik_ui(c):
+    ros = menu(f"MikroTik config: {c['name']}", "RouterOS version",
+               [("7", "RouterOS 7.x"), ("6", "RouterOS 6.x")])
+    if ros is None:
+        return
+    values = form("MikroTik config", "Clients routed into GRE: IPs/CIDRs separated by commas.\n"
+                  "Server IP must be the public address MikroTik connects to.", [
+        ("Clients via GRE", ""),
+        ("Server public IPv4", c["local"]),
+        ("Kill switch (yes/no)", "yes"),
+    ])
+    if values is None:
+        return
+    clients = [x.strip() for x in values[0].split(",") if x.strip()]
+    script = routeros_config(c, int(ros), clients, values[1],
+                             fallback=values[2].lower() not in ("yes", "y", "1"))
+    path = Path(f"/root/mikrotik-{c['name']}-ros{ros}.rsc")
+    while True:
+        choice = menu(f"RouterOS {ros}: {c['name']}", "Script is ready. How to get it?", [
+            ("1", "Print as plain text to copy with the mouse"),
+            ("2", "Copy to local clipboard (OSC 52 terminal escape)"),
+            ("3", f"Save to {path}"),
+            ("4", "View in a scrollable window"),
+        ])
+        if choice is None:
+            return
+        if choice == "1":
+            plain_print(script)
+        elif choice == "2":
+            osc52_copy(script)
+            msg("Sent to your terminal clipboard. Works in Windows Terminal, iTerm2, kitty,\n"
+                "WezTerm, recent xterm; tmux needs 'set -g set-clipboard on'.\n"
+                "PuTTY and old consoles ignore it: use option 1 instead.")
+        elif choice == "3":
+            path.write_text(script, encoding="utf-8")
+            msg(f"Saved: {path}\nUpload it to MikroTik (Files) and run: /import {path.name}")
+        elif choice == "4":
+            textbox(f"RouterOS {ros}: {c['name']}", script)
+
+
+def plain_print(text):
+    """Leave dialog and print raw text: no borders, no truncation, mouse-copyable."""
+    sys.stdout.write("\033[H\033[2J" + text + "\n" + "-" * 60 + "\n")
+    sys.stdout.flush()
+    try:
+        input("Select and copy the script above, then press Enter to return... ")
+    except EOFError:
+        pass
+
+
+def osc52_copy(text):
+    payload = base64.b64encode(text.encode("utf-8")).decode("ascii")
+    seq = f"\033]52;c;{payload}\a"
+    if os.environ.get("TMUX"):
+        seq = "\033Ptmux;" + seq.replace("\033", "\033\033") + "\033\\"
+    sys.stdout.write(seq)
+    sys.stdout.flush()
 
 
 def isolated_live_update(name, old_rules, new_profile):
@@ -2714,6 +2874,8 @@ Usage:
   sudo gre-manager bulk-security --mode isolated --all [--commit] [--apply]
   sudo gre-manager allocate [POOL_CIDR]    # preview next free server/client /30
   sudo gre-manager peer TUNNEL             # RouterOS GRE IP/route instructions
+  sudo gre-manager mikrotik TUNNEL [--ros 6|7] [--clients IP,CIDR] [--server-ip IPv4]
+                            [--fallback] [-o FILE.rsc]  # full RouterOS script
   sudo gre-manager internet TUNNEL         # show NAT/forwarding status and config
   sudo gre-manager internet TUNNEL --enable --wan eth0 --sources 10.255.10.0/30[,192.168.88.0/24] [--commit] [--apply]
   sudo gre-manager internet TUNNEL --disable [--commit] [--apply]
@@ -2817,6 +2979,24 @@ Automatic pre-change ZIP backups go to /var/backups/gre-manager.
                                         else read_pool()), indent=2))
     elif op == "peer" and len(sys.argv) == 3:
         print(mikrotik_notes(load(sys.argv[2])))
+    elif op == "mikrotik":
+        parser = argparse.ArgumentParser(prog="gre-manager mikrotik")
+        parser.add_argument("name")
+        parser.add_argument("--ros", type=int, choices=[6, 7], default=7)
+        parser.add_argument("--clients", default="", help="comma-separated IPs/CIDRs routed into GRE")
+        parser.add_argument("--server-ip", default="", help="public server IPv4 if behind NAT")
+        parser.add_argument("--fallback", action="store_true",
+                            help="no kill switch: clients use main WAN while GRE is down")
+        parser.add_argument("-o", "--output", default="", help="write .rsc file instead of stdout")
+        args = parser.parse_args(sys.argv[2:])
+        script = routeros_config(load(args.name), args.ros,
+                                 [x.strip() for x in args.clients.split(",") if x.strip()],
+                                 args.server_ip, args.fallback)
+        if args.output:
+            Path(args.output).write_text(script, encoding="utf-8")
+            print(f"Saved: {args.output}")
+        else:
+            print(script, end="")
     elif op == "bulk-internet":
         parser = argparse.ArgumentParser(prog="gre-manager bulk-internet")
         action = parser.add_mutually_exclusive_group(required=True)

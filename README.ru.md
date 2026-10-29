@@ -8,7 +8,7 @@
 [![Status](https://img.shields.io/badge/status-pre--production-orange.svg)](#-безопасность-и-ограничения)
 [![Python](https://img.shields.io/badge/python-3.x-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/platform-Debian%20%7C%20Ubuntu-A81D33.svg?logo=debian&logoColor=white)](#-установка)
-[![Tests](https://img.shields.io/badge/unit%20tests-57-success.svg)](#-тестирование)
+[![Tests](https://img.shields.io/badge/unit%20tests-62-success.svg)](#-тестирование)
 [![MikroTik](https://img.shields.io/badge/peer-MikroTik%20RouterOS-293239.svg)](#-новый-gre-до-mikrotik)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 
@@ -57,7 +57,7 @@ GRE Manager — это TUI в одном файле на Python + `dialog`, уд
 | 📦 **Массовые операции** | NAT и режим безопасности для всех или выбранных туннелей |
 | 💾 **Бэкап / восстановление** | ZIP-архивы, автоматические снимки перед изменениями |
 | ⚙️ **systemd** | Отдельный `gre-manager@<туннель>.service` на каждый туннель, опциональный автозапуск |
-| 📟 **Подсказки для MikroTik** | Готовые команды RouterOS для стороны пира |
+| 📟 **Скрипты для MikroTik** | Полный конфиг RouterOS 6 / 7: GRE, таблица маршрутизации, mangle, address list, NAT |
 
 ## 🆕 Что нового в v1.5
 
@@ -133,6 +133,27 @@ sudo gre-manager
 
 > [!IMPORTANT]
 > Маршрут до **публичного underlay IP** сервера должен идти мимо туннеля. RouterOS автоматически не настраивается — `sudo gre-manager peer gre1` выводит рекомендуемые команды.
+
+### Полный скрипт для MikroTik (RouterOS 6 / 7)
+
+TUI: меню туннеля → `Generate full MikroTik script`. Результат можно вывести простым текстом для копирования мышью (без рамок dialog), отправить сразу в локальный буфер обмена через OSC 52 (Windows Terminal, iTerm2, kitty, WezTerm; в tmux нужен `set -g set-clipboard on`), сохранить в `.rsc` или посмотреть в окне. Или через CLI:
+
+```bash
+sudo gre-manager mikrotik gre1 --ros 7 --clients 192.168.88.10,192.168.88.0/24
+sudo gre-manager mikrotik gre1 --ros 6 --clients 192.168.88.10 -o /root/gre1.rsc
+```
+
+Скрипт создаёт GRE-интерфейс (keepalive выключен, MTU из профиля), его адрес `/30`, отдельную таблицу маршрутизации (`/routing table` в v7, `routing-mark` в v6) с маршрутом по умолчанию через внутренний IP сервера и `check-gateway=ping`, address-list клиентов и список исключений для частных сетей, mangle (метка соединения → метка маршрута, MSS clamp), маскарад в туннель и исключает помеченные соединения из FastTrack. Через GRE идут только клиенты из списка; сам роутер и публичный адрес GRE-сервера остаются в основной таблице.
+
+| Параметр | Значение |
+|---|---|
+| `--ros 6\|7` | Версия RouterOS (по умолчанию 7) |
+| `--clients` | IP / CIDR клиентов, которых заворачивать в туннель |
+| `--server-ip` | Публичный IPv4 сервера, если сервер за NAT |
+| `--fallback` | Без kill switch: пока GRE лежит, клиенты ходят через основной WAN |
+| `-o FILE` | Сохранить как `.rsc` для `/import` |
+
+Все объекты помечены `comment="gre-manager:<туннель>"`; команды удаления — в конце скрипта.
 
 ## 🛡️ Режимы firewall
 
@@ -257,6 +278,7 @@ sudo gre-manager audit                             # аудит firewall / ад�
 sudo gre-manager pool [NEW_POOL_CIDR]              # показать/изменить пул /30
 sudo gre-manager allocate [POOL_CIDR]              # предпросмотр следующего свободного /30
 sudo gre-manager peer TUNNEL                       # инструкции для RouterOS
+sudo gre-manager mikrotik TUNNEL [--ros 6|7] [--clients IPs] [--server-ip IPv4] [--fallback] [-o FILE]
 sudo gre-manager internet TUNNEL [--enable|--disable] [--wan WAN] [--sources CIDRs] [--commit] [--apply]
 sudo gre-manager bulk-internet --enable|--disable --all|--tunnels A,B [--wan WAN] [--commit] [--apply]
 sudo gre-manager bulk-security --mode MODE --all|--tunnels A,B [--commit] [--apply]
@@ -303,7 +325,7 @@ python3 -m py_compile gre-manager.py
 sudo python3 -m unittest -v test_gre_manager.py test_v15.py
 ```
 
-57 юнит-тестов на моках / фикстурах для iproute2, iptables и systemd. Тестам CLI нужен root (`sudo`). Живые интеграционные тесты в network namespace **не** проводились.
+62 юнит-теста на моках / фикстурах для iproute2, iptables и systemd. Тестам CLI нужен root (`sudo`). Живые интеграционные тесты в network namespace **не** проводились.
 
 ## 📂 Файлы
 
