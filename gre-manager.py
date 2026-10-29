@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GRE Manager v1.4: an SSH-friendly dialog UI for IPv4 GRE tunnels on Linux.
+"""GRE Manager v1.5: an SSH-friendly dialog UI for IPv4 GRE tunnels on Linux.
 
 Persistent configuration is deliberately independent of Netplan,
 NetworkManager and ifupdown. Only interfaces configured by this utility
@@ -16,6 +16,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -23,13 +24,17 @@ import tempfile
 import urllib.request
 import zipfile
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 BASE = Path("/etc/gre-manager/tunnels")
 STATE = Path("/run/gre-manager")
 BACKUP_DIR = Path("/var/backups/gre-manager")
 SETTINGS_PATH = Path("/etc/gre-manager/settings.json")
 FORWARD_SYSCTL = Path("/etc/sysctl.d/90-gre-manager-forward.conf")
 DEFAULT_POOL = "10.255.10.0/24"
+LEGACY_PEERS = Path("/etc/gre-peers.conf")
+ACL_PATH = Path("/etc/gre-manager/gre-input-acl.json")
+ACL_UNIT = Path("/etc/systemd/system/gre-manager-input-acl.service")
+ACL_RUNTIME = Path("/run/gre-manager/input-acl.json")
 BACKUP_MAGIC = "gre-manager-managed-tunnels"
 BACKUP_SCHEMA = 1
 UNIT_PATH = Path("/etc/systemd/system/gre-manager@.service")
@@ -46,6 +51,24 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart={BIN_PATH} _up %i
 ExecStop={BIN_PATH} _down %i
+TimeoutStartSec=30
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+ACL_SERVICE = f"""[Unit]
+Description=GRE Manager optional public-underlay peer whitelist
+Wants=network-online.target
+After=network-online.target netfilter-persistent.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart={BIN_PATH} _acl_restore
+ExecStop={BIN_PATH} _acl_clear
 TimeoutStartSec=30
 TimeoutStopSec=20
 
@@ -141,12 +164,83 @@ def peer_address(c):
     return str(other[0]) if len(other) == 1 else ""
 
 
+def external_address_occupancy(pool, exclude_device=""):
+    """Inventory kernel IPv4 addresses, routes and parseable legacy CIDRs.
+
+    Each record is (IPv4Network, evidence). If the kernel inventory cannot be
+    queried reliably, allocation refuses to guess that an address is free.
+    """
+    scope = ipaddress.IPv4Network(pool_validate(pool))
+    used = []
+    def add(value, evidence):
+        try:
+            item = ipaddress.IPv4Network(str(value), strict=False)
+            if item.overlaps(scope):
+                used.append((item, evidence))
+        except ValueError:
+            pass
+    for name in names():
+        c = load(name)
+        for addr in [c["address"]] + c.get("extra_addresses", []):
+            add(ipaddress.IPv4Interface(addr).network, f"managed:{name}")
+    commands = [(["ip", "-j", "-4", "addr", "show"], "kernel-addresses"),
+                (["ip", "-j", "-4", "route", "show", "table", "all"], "kernel-routes")]
+    for command, evidence in commands:
+        result = run(command, check=False)
+        if result.returncode != 0:
+            raise GreError(f"Cannot audit {evidence}; refusing automatic GRE IP allocation: "
+                           f"{result.stderr.strip()}")
+        try:
+            rows = json.loads(result.stdout)
+            if not isinstance(rows, list):
+                raise ValueError("expected JSON list")
+        except (ValueError, TypeError) as e:
+            raise GreError(f"Cannot parse {evidence}; refusing allocation: {e}") from e
+        for entry in rows:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("dev") == exclude_device or entry.get("ifname") == exclude_device:
+                continue
+            if evidence == "kernel-addresses":
+                for addr in entry.get("addr_info", []):
+                    if addr.get("family") == "inet" and addr.get("local"):
+                        add(f"{addr['local']}/{addr['prefixlen']}",
+                            f"interface:{entry.get('ifname', '?')}")
+            else:
+                dst = entry.get("dst", "default")
+                if dst != "default" and dst:
+                    add(dst, f"route:{entry.get('dev', '?')}:{entry.get('table', 'main')}")
+    if LEGACY_PEERS.exists():
+        # Legacy records are not standardized. Extract only explicit IPv4 CIDRs;
+        # audit warns that bare IPs/other scripts require manual migration review.
+        contents = LEGACY_PEERS.read_text(encoding="utf-8", errors="replace")
+        for entry in re.findall(r"(?<![0-9.])(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?(?![0-9./])", contents):
+            # Bare legacy IPv4: conservatively reserve at least its /32.
+            add(entry if "/" in entry else entry + "/32", f"legacy:{LEGACY_PEERS}")
+    return used
+
+
+def address_conflicts(address, exclude_name="", extra=()):
+    """Report networks that collide with the candidate GRE subnet."""
+    candidate = ipaddress.IPv4Interface(address).network
+    # A /30 is inside the allocator pool; if outside, still scan the complete
+    # host inventory with a host-specific audit scope.
+    scope = str(candidate)
+    if candidate.prefixlen > 30:
+        scope = str(ipaddress.IPv4Network(f"{candidate.network_address}/30", strict=False))
+    matches = external_address_occupancy(scope, exclude_device=exclude_name)
+    return [(str(n), evidence) for n, evidence in matches
+            if n.overlaps(candidate) and evidence != f"managed:{exclude_name}"]
+
+
 def allocate_pair(pool, existing=None):
-    """Allocate a distinct /30 for a GRE link from a private pool."""
+    """Choose /30 after checking managed and unmanaged host address usage."""
     pool = ipaddress.IPv4Network(pool_validate(pool))
     if existing is None:
-        existing = [ipaddress.IPv4Interface(load(n)["address"]).network for n in names()]
-    used = [ipaddress.IPv4Network(str(n), strict=False) for n in existing]
+        occupancy = external_address_occupancy(str(pool))
+        used = [n for n, _ in occupancy]
+    else:
+        used = [ipaddress.IPv4Network(str(n), strict=False) for n in existing]
     for subnet in pool.subnets(new_prefix=30) if pool.prefixlen < 30 else (pool,):
         if all(not subnet.overlaps(n) for n in used):
             server, client = tuple(subnet.hosts())
@@ -245,6 +339,18 @@ def validate(c):
         if not key.isdecimal() or not (0 <= int(key) <= 4294967295):
             raise GreError("GRE key must be 0..4294967295 (not encryption)")
         key = str(int(key))
+    extras = c.get("extra_addresses", [])
+    if not isinstance(extras, list) or len(extras) > 16:
+        raise GreError("extra_addresses must be a list of up to 16 IPv4 prefixes")
+    try:
+        extras = [str(ipaddress.IPv4Interface(str(a).strip())) for a in extras]
+    except ValueError as e:
+        raise GreError(f"Invalid additional GRE IPv4 address: {e}") from e
+    if len(set(extras + [str(iface)])) != len(extras) + 1:
+        raise GreError("Duplicate GRE IPv4 address")
+    fw_mode = str(c.get("firewall_mode", "legacy")).strip()
+    if fw_mode not in ("legacy", "isolated", "isolated-pass"):
+        raise GreError("firewall_mode must be legacy, isolated or isolated-pass")
     routes = [make_route(**dict(r, local=local, remote=remote))
               for r in c.get("routes", [])]
     route_keys = [(r["dest"], r["table"], r["metric"]) for r in routes]
@@ -259,7 +365,8 @@ def validate(c):
     if internet["enabled"] and internet["wan"] == name:
         raise GreError("NAT WAN interface must not be the GRE interface")
     return {"name": name, "local": local, "remote": remote,
-            "address": str(iface), "mtu": mtu, "ttl": ttl,
+            "address": str(iface), "extra_addresses": extras,
+            "firewall_mode": fw_mode, "mtu": mtu, "ttl": ttl,
             "key": key, "routes": routes, "rules": rules,
             "internet": internet}
 
@@ -418,8 +525,53 @@ def iptables_spec(table, chain, spec, action):
     return ["iptables", "-w", "-t", table, action, chain] + spec
 
 
+def firewall_chain(name):
+    """Dedicated per-tunnel chain. Stable and within iptables chain length."""
+    config_path(name)
+    return "GMF_" + hashlib.sha256(name.encode("utf-8")).hexdigest()[:12]
+
+
+def isolated_firewall_rules(c):
+    """Owned per-GRE FORWARD chain: explicit allow and terminal DROP.
+
+    Filter hooks precede the old generic gre+ ACCEPT at installation. This
+    prevents traffic traversing that old permissive rule provided nothing
+    subsequently inserts a preceding ACCEPT (audit reports such reorderings).
+    """
+    gre, table = c["name"], "filter"
+    chain = firewall_chain(gre)
+    label = f"gre-manager:{gre}"
+    rules = [{"kind": "chain", "table": table, "chain": chain}]
+    internet = c["internet"]
+    verdict = "RETURN" if c["firewall_mode"] == "isolated-pass" else "ACCEPT"
+    if internet["enabled"]:
+        wan = internet["wan"]
+        for source in internet["sources"]:
+            rules.append({"table": table, "chain": chain, "spec": [
+                "-i", gre, "-o", wan, "-s", source,
+                "-m", "comment", "--comment", label + ":out", "-j", verdict]})
+            rules.append({"table": table, "chain": chain, "spec": [
+                "-i", wan, "-o", gre, "-d", source,
+                "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED",
+                "-m", "comment", "--comment", label + ":return", "-j", verdict]})
+    rules.append({"table": table, "chain": chain, "spec": [
+        "-m", "comment", "--comment", label + ":deny", "-j", "DROP"]})
+    for direction in ("-i", "-o"):
+        rules.append({"table": "filter", "chain": "FORWARD", "spec": [
+            direction, gre, "-m", "comment", "--comment", label + ":isolate", "-j", chain],
+            "insert": True})
+    if internet["enabled"]:
+        for source in internet["sources"]:
+            rules.append({"table": "nat", "chain": "POSTROUTING", "spec": [
+                "-s", source, "-o", internet["wan"],
+                "-m", "comment", "--comment", label + ":nat", "-j", "MASQUERADE"]})
+    return rules
+
+
 def internet_firewall_rules(c):
     """Firewall rules used exclusively for this tunnel; exact specs are state-tracked."""
+    if c.get("firewall_mode", "legacy") in ("isolated", "isolated-pass"):
+        return isolated_firewall_rules(c)
     internet = c["internet"]
     if not internet["enabled"]:
         return []
@@ -459,26 +611,91 @@ def prepare_internet(c):
         run(["sysctl", "-w", "net.ipv4.ip_forward=1"])
 
 
+def _chain_current_rules(table, chain):
+    p = run(["iptables", "-w", "-t", table, "-S", chain], check=False)
+    if p.returncode:
+        return None
+    found = []
+    for line in p.stdout.splitlines():
+        if not line.strip():
+            continue
+        tokens = shlex.split(line)
+        if tokens[:2] == ["-N", chain]:
+            continue
+        if tokens[:2] != ["-A", chain]:
+            raise GreError(f"Unknown iptables content in owned chain {chain}: {line}")
+        found.append(tokens[2:])
+    return found
+
+
 def install_internet(c):
+    """Idempotent across iptables-restore; adopt only exact expected owned rules.
+
+    A persisted rule is safely reusable when its entire specification matches.
+    Unknown content in a supposedly owned chain is never flushed or replaced.
+    """
     rules = internet_firewall_rules(c)
+    if not rules:
+        return []
+    if c.get("firewall_mode", "legacy") in ("isolated", "isolated-pass"):
+        return install_isolated(c, rules)
     added = []
     try:
         for rule in rules:
             table, chain, spec = rule["table"], rule["chain"], rule["spec"]
             exists = run(iptables_spec(table, chain, spec, "-C"), check=False)
             if exists.returncode == 0:
-                raise GreError(f"Firewall rule for {c['name']} exists without ownership state")
+                continue  # restored by netfilter-persistent: take ownership
             run(["iptables", "-w", "-t", table, "-I", chain, "1"] + spec)
             added.append(rule)
     except Exception:
         remove_internet(added)
         raise
-    return added
+    return rules
+
+
+def install_isolated(c, rules=None):
+    rules = rules if rules is not None else isolated_firewall_rules(c)
+    owner = rules[0]
+    chain = owner["chain"]
+    expected = [r["spec"] for r in rules if r.get("chain") == chain and "spec" in r]
+    actual = _chain_current_rules("filter", chain)
+    if actual is not None and actual != expected:
+        raise GreError(f"Existing {chain} is not identical to manager's expected rules; "
+                       "check netfilter-persistent and legacy firewall; refusing takeover")
+    added = []
+    try:
+        if actual is None:
+            run(["iptables", "-w", "-t", "filter", "-N", chain])
+            added.append(owner)
+            for rule in rules:
+                if rule.get("chain") == chain and "spec" in rule:
+                    run(["iptables", "-w", "-t", "filter", "-A", chain] + rule["spec"])
+                    added.append(rule)
+        for rule in rules:
+            if rule.get("chain") == chain or rule.get("kind") == "chain":
+                continue
+            table, target, spec = rule["table"], rule["chain"], rule["spec"]
+            if run(iptables_spec(table, target, spec, "-C"), check=False).returncode == 0:
+                continue
+            cmd = "-I" if rule.get("insert") else "-A"
+            params = ["1"] if rule.get("insert") else []
+            run(["iptables", "-w", "-t", table, cmd, target] + params + spec)
+            added.append(rule)
+    except Exception:
+        remove_internet(added)
+        raise
+    return rules
 
 
 def remove_internet(rules):
+    """Delete only exact owned rules; never flush built-in/foreign chains."""
     for rule in reversed(rules):
-        run(iptables_spec(rule["table"], rule["chain"], rule["spec"], "-D"), check=False)
+        if rule.get("kind") == "chain":
+            # This fails safely if another owner has added rules to our chain.
+            run(["iptables", "-w", "-t", rule["table"], "-X", rule["chain"]], check=False)
+        else:
+            run(iptables_spec(rule["table"], rule["chain"], rule["spec"], "-D"), check=False)
 
 
 def missing_client_routes(c):
@@ -504,12 +721,22 @@ def up(name):
            "local", c["local"], "remote", c["remote"], "ttl", str(c["ttl"])]
     if c["key"]:
         cmd += ["key", c["key"]]
-    run(cmd)
     installed_rules = []
     installed_nat = []
+    created = False
     try:
+        # Isolated mode installs DENY guard BEFORE the GRE device can forward.
+        # Legacy profiles keep their original startup sequencing.
+        if c["firewall_mode"] in ("isolated", "isolated-pass"):
+            if c["internet"]["enabled"]:
+                prepare_internet(c)
+            installed_nat = install_internet(c)
+        run(cmd)
+        created = True
         run(["ip", "link", "set", "dev", name, "mtu", str(c["mtu"]), "up"])
         run(["ip", "-4", "addr", "add", c["address"], "dev", name])
+        for extra in c.get("extra_addresses", []):
+            run(["ip", "-4", "addr", "add", extra, "dev", name])
         for r in c["routes"]:
             args = ["ip", "-4", "route", "add", r["dest"]]
             if r["via"]:
@@ -522,15 +749,16 @@ def up(name):
                     "from", r["src"], "table", r["table"]]
             run(args)
             installed_rules.append(r)
-        if c["internet"]["enabled"]:
+        if c["firewall_mode"] == "legacy" and c["internet"]["enabled"]:
             prepare_internet(c)
             installed_nat = install_internet(c)
         runtime_write(c, installed_nat)
     except Exception:
-        remove_internet(installed_nat)
         for r in reversed(installed_rules):
             remove_rule(r)
-        run(["ip", "link", "delete", "dev", name], check=False)
+        if created:
+            run(["ip", "link", "delete", "dev", name], check=False)
+        remove_internet(installed_nat)
         raise
 
 
@@ -546,11 +774,13 @@ def down(name):
         info = json.loads(run(["ip", "-j", "link", "show", "dev", name]).stdout)[0]
         if info["ifindex"] != state["ifindex"]:
             raise GreError("GRE interface has changed owner (ifindex mismatch)")
-    remove_internet(state.get("nat_rules", []))
-    for r in state.get("rules", []):
-        remove_rule(r)
+    # Tear down data plane first. Never expose a still-live GRE to inherited
+    # gre+ ACCEPT rules after lifting manager isolation hooks.
     if live_interface(name):
         run(["ip", "link", "delete", "dev", name])
+    for r in state.get("rules", []):
+        remove_rule(r)
+    remove_internet(state.get("nat_rules", []))
     rp = runtime_path(name)
     if rp.exists():
         rp.unlink()
@@ -565,6 +795,12 @@ def setup():
     else:
         UNIT_PATH.write_text(SERVICE, encoding="utf-8")
         os.chmod(UNIT_PATH, 0o644)
+    if ACL_UNIT.exists():
+        if ACL_UNIT.read_text(encoding="utf-8") != ACL_SERVICE:
+            raise GreError(f"Existing input ACL unit differs: {ACL_UNIT}; refusing overwrite")
+    else:
+        ACL_UNIT.write_text(ACL_SERVICE, encoding="utf-8")
+        os.chmod(ACL_UNIT, 0o644)
     BASE.mkdir(parents=True, exist_ok=True, mode=0o700)
     run(["systemctl", "daemon-reload"])
 
@@ -827,6 +1063,367 @@ def bulk_local(new_local, from_local="", apply=False, allow_unassigned=False):
 
 
 
+def live_gre_inventory():
+    """Read GRE links via iproute2 JSON. No kernel modifications."""
+    response = run(["ip", "-d", "-j", "link", "show"], check=False)
+    if response.returncode:
+        raise GreError("Cannot inventory kernel GRE devices: " + response.stderr.strip())
+    try:
+        rows = json.loads(response.stdout)
+        if not isinstance(rows, list):
+            raise ValueError("not an array")
+    except (ValueError, TypeError) as e:
+        raise GreError("Unparseable GRE inventory: " + str(e)) from e
+    return {x["ifname"]: x for x in rows
+            if isinstance(x, dict) and x.get("linkinfo", {}).get("info_kind") == "gre"
+            and x.get("ifname")}
+
+
+def staged_live_profile(name):
+    """Build an inert profile for an unmanaged GRE device; do not adopt it live.
+
+    Existing external script/systemd, ip rules and firewall are deliberately
+    untouched. Operator must resolve service ownership before cutover.
+    """
+    config_path(name)
+    if config_path(name).exists():
+        raise GreError(f"{name} already has a managed configuration")
+    info = live_gre_inventory().get(name)
+    if info is None:
+        raise GreError(f"Unmanaged Linux GRE interface {name} not found")
+    data = info.get("linkinfo", {}).get("info_data", {})
+    local, remote = data.get("local", ""), data.get("remote", "")
+    if not local or not remote or local in ("any", "0.0.0.0") or remote in ("any", "0.0.0.0"):
+        raise GreError("Imported GRE must have explicit local and remote IPv4 endpoints")
+    if data.get("ikey") and data.get("okey") and data["ikey"] != data["okey"]:
+        raise GreError("Different ingress/egress GRE keys: manual conversion required")
+    raw = run(["ip", "-j", "-4", "addr", "show", "dev", name])
+    addresses = []
+    for dev in json.loads(raw.stdout):
+        for entry in dev.get("addr_info", []):
+            if entry.get("family") == "inet" and entry.get("local"):
+                addresses.append(f"{entry['local']}/{entry['prefixlen']}")
+    if not addresses:
+        raise GreError(f"{name} has no IPv4 address; specify primary GRE IP manually")
+    if len(addresses) > 17:
+        raise GreError("GRE interface has too many addresses for one profile")
+    route_json = run(["ip", "-j", "-4", "route", "show", "table", "all"])
+    routes = []
+    primary_networks = [ipaddress.IPv4Interface(a).network for a in addresses]
+    for route in json.loads(route_json.stdout):
+        if route.get("dev") != name or route.get("dst") in ("default", None):
+            continue
+        dest = route["dst"]
+        if route.get("protocol") == "kernel" or route.get("proto") == "kernel":
+            continue
+        if any(str(n) == network(dest, "Route") for n in primary_networks):
+            continue
+        table = route.get("table", "main")
+        if table in (254, "254"):
+            table = "main"
+        if table in ("local", 255, "255"):
+            continue
+        routes.append(make_route(dest, via=route.get("gateway", ""),
+                                 metric=route.get("metric", 100), table=table,
+                                 local=local, remote=remote))
+    key = data.get("ikey", data.get("key", ""))
+    if isinstance(key, str) and key.startswith("0x"):
+        key = str(int(key, 16))
+    c = validate({"name": name, "local": local, "remote": remote,
+                  "address": addresses[0], "extra_addresses": addresses[1:],
+                  "mtu": info.get("mtu", 1400), "ttl": data.get("ttl", 250),
+                  "key": key, "routes": routes, "rules": [],
+                  "internet": {"enabled": False, "wan": "", "sources": []},
+                  "firewall_mode": "isolated-pass"})
+    return {"profile": c,
+            "warnings": ["STAGED ONLY: NO OWNERSHIP TRANSFER; kernel device unchanged",
+                         "Old scripts/services/cron/boot automation must be disabled manually",
+                         "Policy routing rules cannot be attributed reliably: review ip -4 rule",
+                         "Old firewall/NAT and iptables-persistent need separate review",
+                         "NAT is OFF and isolated forwarding will DROP until configured",
+                         "At cutover stop old owner, verify GRE interface removed, then start gre-manager@NAME"]}
+
+
+def stage_live(name):
+    plan = staged_live_profile(name)
+    collisions = address_conflicts(plan["profile"]["address"], exclude_name=name)
+    if collisions:
+        plan["warnings"].append(f"Live network overlaps require review before cutover: {collisions[:8]}")
+    safety_backup("before-staging")
+    save(plan["profile"])
+    return plan
+
+
+def firewall_audit():
+    """Inspect applied and inherited firewall rules without changing anything."""
+    result = {"tunnels": {}, "warnings": [], "legacy_rules": [],
+              "persistent_firewall": Path("/etc/iptables/rules.v4").exists()}
+    filt = run(["iptables", "-w", "-t", "filter", "-S", "FORWARD"], check=False)
+    nat = run(["iptables", "-w", "-t", "nat", "-S", "POSTROUTING"], check=False)
+    if filt.returncode or nat.returncode:
+        result["warnings"].append("Cannot inspect iptables; check permissions/backend")
+        return result
+    fw_lines = filt.stdout.splitlines()
+    nat_lines = nat.stdout.splitlines()
+    for line in fw_lines:
+        if ("gre+" in line and "ACCEPT" in line) or ("-j ACCEPT" in line and "-i gre" in line):
+            result["legacy_rules"].append(line)
+    for line in nat_lines:
+        if "MASQUERADE" in line and "gre-manager" not in line:
+            result["legacy_rules"].append(line)
+    for name in names():
+        cfg = load(name)
+        expected = internet_firewall_rules(cfg)
+        notes = []
+        if cfg["firewall_mode"] == "legacy":
+            notes.append("Legacy mode: no guaranteed isolation from broad FORWARD rules")
+        if active(name):
+            if cfg["firewall_mode"] in ("isolated", "isolated-pass"):
+                chain = firewall_chain(name)
+                for direction in ("-i", "-o"):
+                    matches = [i for i, line in enumerate(fw_lines)
+                               if f"{direction} {name} " in line and f"-j {chain}" in line]
+                    if not matches:
+                        notes.append(f"MISSING FORWARD isolation hook {direction} for {name}")
+                    elif matches[0] > 2:
+                        notes.append(f"Isolation hook {direction} is not near top of FORWARD; review order")
+                if _chain_current_rules("filter", chain) is None:
+                    notes.append(f"Missing isolation chain {chain}")
+            else:
+                for entry in expected:
+                    if entry.get("table") not in ("filter", "nat"):
+                        continue
+                    if run(iptables_spec(entry["table"], entry["chain"], entry["spec"], "-C"),
+                           check=False).returncode != 0:
+                        notes.append("Missing manager firewall rule")
+        result["tunnels"][name] = {"active": active(name),
+                                   "firewall_mode": cfg["firewall_mode"],
+                                   "internet_enabled": cfg["internet"]["enabled"],
+                                   "issues": notes}
+    if any("-j GRE-FORWARD" in x for x in fw_lines):
+        for name in names():
+            c=load(name)
+            if c["firewall_mode"] == "isolated" and active(name):
+                result["tunnels"][name]["issues"].append(
+                    "ISOLATED ACCEPT may bypass GRE-FORWARD; choose isolated-pass "
+                    "when existing downstream firewall checks must still run")
+    if result["legacy_rules"]:
+        result["warnings"].append("Broad legacy firewall rules exist; disabling NAT "
+                                  "may not block forwarding for legacy-mode tunnels")
+    if result["persistent_firewall"]:
+        result["warnings"].append("netfilter-persistent detected: avoid persisting "
+                                  "runtime manager chains before completing migration")
+    return result
+
+
+def firewall_reconcile(name):
+    """Reattach missing rules on a live managed tunnel, no interface restart.
+
+    Refuse if config was edited without applying; do not guess which policy
+    the running tunnel is intended to use.
+    """
+    c = load(name)
+    if not active(name) or not live_interface(name):
+        raise GreError("Reconcile requires an active managed GRE")
+    state = runtime_read(name)
+    info = json.loads(run(["ip", "-j", "link", "show", "dev", name]).stdout)[0]
+    if info["ifindex"] != state["ifindex"]:
+        raise GreError("Interface ownership changed (ifindex mismatch)")
+    if state.get("nat_rules", []) != internet_firewall_rules(c):
+        raise GreError("Saved firewall differs from running policy; apply/restart first")
+    if c["internet"]["enabled"]:
+        prepare_internet(c)
+    rules = install_internet(c)
+    state["nat_rules"] = rules
+    runtime_write(c, rules)
+    return {"tunnel": name, "reconciled": True, "rules": len(rules)}
+
+
+def underlay_acl_plan(local, wan):
+    """Prepare a LOCAL+WAN-scoped GRE input whitelist for a dedicated address.
+
+    Only valid if ALL kernel GRE interfaces bound to this local IP are managed,
+    and existing live kernel devices really belong to active manager services.
+    No external/legacy interface may be present on the same underlay IP.
+    """
+    local = ip4(local, "GRE ACL underlay local address")
+    wan = str(wan).strip()
+    if not IFNAME_RE.fullmatch(wan):
+        raise GreError("Invalid GRE ACL WAN interface")
+    ensure_local_ip(local)
+    if not live_interface(wan):
+        raise GreError("GRE ACL WAN interface is missing")
+    configured = [c for c in (load(n) for n in names()) if c["local"] == local]
+    if not configured:
+        raise GreError("No GRE Manager profiles use this underlay local address")
+    unmanaged = []
+    for name, link in live_gre_inventory().items():
+        data = link.get("linkinfo", {}).get("info_data", {})
+        if data.get("local") != local:
+            continue
+        if name not in names() or not active(name):
+            unmanaged.append(name)
+        else:
+            # An active unit alone is insufficient: the kernel interface could
+            # have been deleted/recreated by another owner.
+            try:
+                owned = runtime_read(name)["ifindex"]
+                if owned != link.get("ifindex"):
+                    unmanaged.append(name)
+            except (GreError, KeyError, OSError, ValueError, TypeError):
+                unmanaged.append(name)
+    if unmanaged:
+        raise GreError("Unsafe to enable GRE input ACL: unmanaged or staged live "
+                       f"tunnels share local {local}: {', '.join(sorted(unmanaged))}")
+    peers = sorted(set(c["remote"] for c in configured),
+                   key=lambda ip: int(ipaddress.IPv4Address(ip)))
+    chain = "GMI_" + hashlib.sha256(f"{local}:{wan}".encode()).hexdigest()[:12]
+    label = f"gre-manager:input:{chain}"
+    rules = [{"kind": "chain", "table": "filter", "chain": chain}]
+    for peer in peers:
+        rules.append({"table":"filter", "chain":chain,
+                      "spec":["-s",peer,"-m","comment","--comment",label+":peer","-j","RETURN"]})
+    rules.append({"table":"filter", "chain":chain,
+                  "spec":["-m","comment","--comment",label+":deny","-j","DROP"]})
+    rules.append({"table":"filter", "chain":"INPUT", "insert":True,
+                  "spec":["-i",wan,"-d",local,"-p","47","-m","comment",
+                          "--comment",label+":hook","-j",chain]})
+    return {"local":local,"wan":wan,"peers":peers,"rules":rules,
+            "warning":"RETURN for allowed IPs continues existing INPUT filtering. "
+                      "Other GRE sources to this local/WAN will be dropped. GRE is not encrypted."}
+
+
+def underlay_acl_install(plan):
+    rules = plan["rules"]
+    chain = rules[0]["chain"]
+    expected = [r["spec"] for r in rules if r.get("chain") == chain and "spec" in r]
+    present = _chain_current_rules("filter",chain)
+    if present is not None and present != expected:
+        raise GreError(f"Existing ACL chain {chain} differs; manual review required")
+    added=[]
+    try:
+        if present is None:
+            run(["iptables","-w","-t","filter","-N",chain])
+            added.append(rules[0])
+            for rule in rules[1:-1]:
+                run(["iptables","-w","-t","filter","-A",chain]+rule["spec"])
+                added.append(rule)
+        hook=rules[-1]
+        if run(iptables_spec("filter","INPUT",hook["spec"],"-C"),check=False).returncode:
+            run(["iptables","-w","-t","filter","-I","INPUT","1"]+hook["spec"])
+            added.append(hook)
+    except Exception:
+        remove_internet(added)
+        raise
+    return rules
+
+
+def underlay_acl_restore():
+    if not ACL_PATH.exists():
+        raise GreError("Input ACL not configured")
+    raw=json.loads(ACL_PATH.read_text(encoding="utf-8"))
+    plan=underlay_acl_plan(raw["local"],raw["wan"])
+    rules=underlay_acl_install(plan)
+    STATE.mkdir(parents=True,exist_ok=True,mode=0o700)
+    ACL_RUNTIME.write_text(json.dumps(rules),encoding="utf-8")
+    os.chmod(ACL_RUNTIME,0o600)
+    return plan
+
+
+def underlay_acl_clear():
+    if not ACL_RUNTIME.exists():
+        raise GreError("No GRE input ACL ownership state; refusing unsafe cleanup")
+    rules=json.loads(ACL_RUNTIME.read_text(encoding="utf-8"))
+    remove_internet(rules)
+    ACL_RUNTIME.unlink()
+
+
+def underlay_acl_reconcile():
+    """Recover missing INPUT hook or update peers while DROP stays in force.
+
+    Never blindly replace an ACL chain owned by a different process.
+    """
+    if not ACL_PATH.exists():
+        raise GreError("GRE INPUT ACL is not configured")
+    settings=json.loads(ACL_PATH.read_text(encoding="utf-8"))
+    plan=underlay_acl_plan(settings["local"],settings["wan"])
+    rules=plan["rules"]
+    chain=rules[0]["chain"]
+    current=_chain_current_rules("filter",chain)
+    expected=[r["spec"] for r in rules[1:-1]]
+    if current is None or current == expected:
+        underlay_acl_install(plan)
+    else:
+        if not ACL_RUNTIME.exists():
+            raise GreError("INPUT ACL differs and runtime ownership missing; refusing rewrite")
+        old=json.loads(ACL_RUNTIME.read_text(encoding="utf-8"))
+        if old[0].get("chain") != chain:
+            raise GreError("Unexpected INPUT ACL ownership token")
+        former=[r["spec"] for r in old[1:-1]]
+        if current != former:
+            raise GreError("INPUT ACL chain modified externally; refusing unsafe rewrite")
+        hook=old[-1]
+        if run(iptables_spec("filter","INPUT",hook["spec"],"-C"),check=False).returncode:
+            raise GreError("INPUT GRE hook missing; reconcile hook before modifying peer list")
+        lock=["-m","comment","--comment",f"gre-manager:acl:{chain}:maintenance","-j","DROP"]
+        run(["iptables","-w","-t","filter","-I",chain,"1"]+lock)
+        removed=[]
+        added=[]
+        try:
+            for entry in old[1:-2]:
+                run(iptables_spec("filter",chain,entry["spec"],"-D"))
+                removed.append(entry)
+            for entry in reversed(rules[1:-2]):
+                run(["iptables","-w","-t","filter","-I",chain,"2"]+entry["spec"])
+                added.append(entry)
+        except Exception as exc:
+            problems=[]
+            for entry in added:
+                try: run(iptables_spec("filter",chain,entry["spec"],"-D"))
+                except Exception as x: problems.append(str(x))
+            for entry in reversed(removed):
+                try: run(["iptables","-w","-t","filter","-I",chain,"2"]+entry["spec"])
+                except Exception as x: problems.append(str(x))
+            if not problems:
+                run(iptables_spec("filter",chain,lock,"-D"))
+            raise GreError(f"GRE INPUT ACL peer update failed: {exc}. "
+                           f"Rollback: {problems or 'OK'} (DROP kept if rollback failed)") from exc
+        run(iptables_spec("filter",chain,lock,"-D"))
+    STATE.mkdir(parents=True,exist_ok=True,mode=0o700)
+    ACL_RUNTIME.write_text(json.dumps(rules),encoding="utf-8")
+    os.chmod(ACL_RUNTIME,0o600)
+    return plan
+
+
+def underlay_acl_enable(local,wan):
+    """Explicit opt-in with dedicated service persistence, no firewall flush."""
+    if not ACL_UNIT.exists():
+        raise GreError("Run 'sudo gre-manager init' to install optional ACL systemd unit")
+    plan=underlay_acl_plan(local,wan)
+    if ACL_PATH.exists():
+        old=json.loads(ACL_PATH.read_text(encoding="utf-8"))
+        if old!={"local":plan["local"],"wan":plan["wan"]}:
+            raise GreError("Different GRE input ACL already configured; disable old one first")
+    ACL_PATH.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+    ACL_PATH.write_text(json.dumps({"local":plan["local"],"wan":plan["wan"]})+"\n")
+    os.chmod(ACL_PATH,0o600)
+    service="gre-manager-input-acl.service"
+    was_active=run(["systemctl","is-active","--quiet",service],check=False).returncode==0
+    p=run(["systemctl","enable","--now",service],check=False)
+    if p.returncode:
+        raise GreError("ACL service failed (configuration saved for review): "+p.stderr)
+    if was_active:
+        underlay_acl_reconcile()
+    return plan
+
+
+def underlay_acl_disable():
+    if not ACL_PATH.exists():
+        raise GreError("No managed public GRE input ACL is configured")
+    run(["systemctl","disable","--now","gre-manager-input-acl.service"])
+    ACL_PATH.unlink()
+
+
 # Dialog UI. Dialog paints to stderr (the TTY) and returns user input via stdout.
 def dlg(args):
     return run(["dialog", "--stdout", "--no-shadow",
@@ -900,20 +1497,24 @@ def tunnel_fields(c=None):
         ("Local underlay IP", local_guess),
         ("Remote underlay IP", c.get("remote", "")),
         ("Server GRE IP / prefix", c.get("address", "10.255.10.1/30")),
-        ("MTU", c.get("mtu", 1476)),
-        ("TTL", c.get("ttl", 64)),
+        ("MTU", c.get("mtu", 1400)),
+        ("TTL", c.get("ttl", 250)),
         ("GRE key (optional)", c.get("key", "")),
+        ("Other GRE IPv4 CIDRs (comma)", ",".join(c.get("extra_addresses", []))),
     ])
     if values is None:
         return None
-    name, local, remote, address, mtu, ttl, key = values
+    values = list(values) + [""] * max(0, 8 - len(values))
+    name, local, remote, address, mtu, ttl, key, extra_text = values[:8]
     result = validate(dict(name=name, local=local, remote=remote,
                            address=address, mtu=mtu, ttl=ttl, key=key,
-                           routes=(c.get("routes", [])), rules=(c.get("rules", [])),
+                           extra_addresses=[x.strip() for x in extra_text.split(",") if x.strip()],
+                           firewall_mode=c.get("firewall_mode", "legacy"),
+                           routes=c.get("routes", []), rules=c.get("rules", []),
                            internet=c.get("internet", {})))
     # If the /30 server-side GRE IP changes, follow it with the NAT peer /32.
     # Do not touch explicitly configured client LANs or unrelated source nets.
-    if c and result["address"] != c["address"] and c["internet"]["sources"]:
+    if c and result["address"] != c["address"] and c.get("internet", {}).get("sources", []):
         old_peer, new_peer = peer_address(c), peer_address(result)
         old_src = old_peer + "/32" if old_peer else ""
         if old_src in result["internet"]["sources"]:
@@ -936,6 +1537,14 @@ def tunnel_fields(c=None):
 
 
 def edit_save(old, modified):
+    if old["address"] != modified["address"]:
+        conflicts = address_conflicts(modified["address"], exclude_name=old["name"])
+        if conflicts:
+            raise GreError(f"GRE address change conflicts with host network: {conflicts[:8]}")
+    for extra in set(modified.get("extra_addresses", [])) - set(old.get("extra_addresses", [])):
+        conflicts = address_conflicts(extra, exclude_name=old["name"])
+        if conflicts:
+            raise GreError(f"Additional GRE IP conflicts with host network: {conflicts[:8]}")
     save(modified)
     name = old["name"]
     if active(name):
@@ -1006,6 +1615,11 @@ def new_tunnel():
         if new_net.overlaps(old_net):
             raise GreError(f"Tunnel GRE subnet {new_net} overlaps {existing_name}: {old_net}")
 
+    # Check the live kernel and legacy peer configs as well as manager profiles.
+    collisions = address_conflicts(c["address"])
+    if collisions:
+        raise GreError("GRE inner address conflicts with host network: " +
+                       "; ".join(f"{n} ({why})" for n, why in collisions[:8]))
     peer = peer_address(c)
     suggested_wan = guess_wan()
     values = form("Automatic Internet sharing", 
@@ -1022,9 +1636,10 @@ def new_tunnel():
     if yesno.lower() not in ("yes", "y", "no", "n"):
         raise GreError("Enable Internet/NAT must be yes or no")
     nat_enabled = yesno.lower() in ("yes", "y")
-    c = auto_internet_config(c, wan=wan, 
+    c = auto_internet_config(c, wan=wan,
                              lan_networks=[x.strip() for x in lan_text.split(",") if x.strip()],
                              enabled=nat_enabled)
+    c = validate(dict(c, firewall_mode="isolated"))
     if nat_enabled:
         for r in c["routes"]:
             if r["table"] == "main":
@@ -1048,6 +1663,15 @@ def new_tunnel():
     if not confirm("Save this GRE tunnel and its Internet/NAT configuration?"):
         return
     save(c)
+    # Update the existing optional protocol-47 allowlist before bringing up a
+    # new peer. If it cannot be refreshed, leave profile saved but STOPPED.
+    if ACL_PATH.exists():
+        try:
+            underlay_acl_reconcile()
+        except GreError as error:
+            msg(f"Profile saved but not activated: INPUT GRE ACL must be "
+                f"reconciled first. {error}", "ACL must be updated")
+            return
     if confirm("Start GRE now AND enable autostart on boot?\n"
                "This will activate GRE, forwarding and NAT rules (if enabled).\n"
                "No = keep profile saved but STOPPED.", "Activate new GRE"):
@@ -1450,6 +2074,75 @@ def mikrotik_notes(c):
             "New GRE profiles set up NAT and LAN routes during creation.\n")
 
 
+def isolated_live_update(name, old_rules, new_profile):
+    """Update per-GRE policy fail-closed without removing FORWARD hooks.
+
+    A temporary first-rule DROP stays active throughout modifications. On any
+    rollback failure, leave it in place (manual recovery required).
+    """
+    chain = firewall_chain(name)
+    new_rules = isolated_firewall_rules(new_profile)
+    old_inner = [r for r in old_rules if r.get("chain") == chain and "spec" in r
+                 and "-j" in r["spec"] and r["spec"][-1] != "DROP"]
+    new_inner = [r for r in new_rules if r.get("chain") == chain and "spec" in r
+                 and r["spec"][-1] != "DROP"]
+    old_nat = [r for r in old_rules if r.get("table") == "nat"]
+    new_nat = [r for r in new_rules if r.get("table") == "nat"]
+    for direction in ("-i", "-o"):
+        hook = next((r for r in old_rules if r.get("chain") == "FORWARD"
+                     and r["spec"][0] == direction), None)
+        if hook is None or run(iptables_spec("filter", "FORWARD", hook["spec"], "-C"),
+                               check=False).returncode != 0:
+            raise GreError("Missing isolation hook; run firewall-reconcile before bulk NAT")
+    if _chain_current_rules("filter", chain) is None:
+        raise GreError("Missing isolation chain; run firewall-reconcile first")
+    lock = ["-m", "comment", "--comment", f"gre-manager:{name}:maintenance", "-j", "DROP"]
+    run(["iptables", "-w", "-t", "filter", "-I", chain, "1"] + lock)
+    added_inner, added_nat = [], []
+    removed_inner, removed_nat = [], []
+    try:
+        for rule in old_nat:
+            if run(iptables_spec("nat", "POSTROUTING", rule["spec"], "-C"),
+                   check=False).returncode == 0:
+                run(iptables_spec("nat", "POSTROUTING", rule["spec"], "-D"))
+                removed_nat.append(rule)
+        for rule in old_inner:
+            run(iptables_spec("filter", chain, rule["spec"], "-D"))
+            removed_inner.append(rule)
+        for rule in reversed(new_inner):
+            run(["iptables", "-w", "-t", "filter", "-I", chain, "2"] + rule["spec"])
+            added_inner.append(rule)
+        for rule in new_nat:
+            if run(iptables_spec("nat", "POSTROUTING", rule["spec"], "-C"),
+                   check=False).returncode != 0:
+                run(["iptables", "-w", "-t", "nat", "-I", "POSTROUTING", "1"] + rule["spec"])
+                added_nat.append(rule)
+    except Exception as exc:
+        problems = []
+        for rule in reversed(added_nat + added_inner):
+            try:
+                run(iptables_spec(rule["table"], rule["chain"], rule["spec"], "-D"))
+            except Exception as e:
+                problems.append(str(e))
+        for rule in reversed(removed_inner):
+            try:
+                run(["iptables", "-w", "-t", "filter", "-I", chain, "2"] + rule["spec"])
+            except Exception as e:
+                problems.append(str(e))
+        for rule in removed_nat:
+            try:
+                run(["iptables", "-w", "-t", "nat", "-I", "POSTROUTING", "1"] + rule["spec"])
+            except Exception as e:
+                problems.append(str(e))
+        if not problems:
+            run(iptables_spec("filter", chain, lock, "-D"))
+        raise GreError(f"Isolated live update failed: {exc}; "
+                       f"rollback issues: {problems or 'none'}; "
+                       f"{'TRAFFIC BLOCKED: repair chain manually' if problems else 'old policy restored'}") from exc
+    run(iptables_spec("filter", chain, lock, "-D"))
+    return new_rules
+
+
 def live_nat_update(name, new_profile):
     """Apply only GRE Manager's firewall rules, without restarting the GRE link.
 
@@ -1470,12 +2163,19 @@ def live_nat_update(name, new_profile):
         return False
     if new_profile["internet"]["enabled"]:
         prepare_internet(new_profile)
+    if (state.get("nat_rules", []) and
+            old_rules[0].get("kind") == "chain" and
+            new_profile.get("firewall_mode") in ("isolated", "isolated-pass")):
+        # Persist state only after all changes have been installed successfully.
+        new_rules = isolated_live_update(name, old_rules, new_profile)
+        runtime_write(new_profile, new_rules)
+        return True
     removed = []
     added = []
     try:
-        for r in old_rules:
-            run(iptables_spec(r["table"], r["chain"], r["spec"], "-D"))
-            removed.append(r)
+        # Isolated chains contain DROP even when Internet/NAT is off.
+        remove_internet(old_rules)
+        removed = list(old_rules)
         if new_rules:
             added = install_internet(new_profile)
         # Preserve ownership token and active ip rule state; only NAT changes.
@@ -1495,14 +2195,99 @@ def live_nat_update(name, new_profile):
     except Exception as exc:
         remove_internet(added)
         issues = []
-        for r in removed:
-            if run(iptables_spec(r["table"], r["chain"], r["spec"], "-C"), check=False).returncode:
-                try:
-                    run(["iptables", "-w", "-t", r["table"], "-I", r["chain"], "1"] + r["spec"])
-                except Exception as rollback_exc:
-                    issues.append(str(rollback_exc))
+        if removed:
+            try:
+                # Reconstruct from original applied rules; no config-file assumptions.
+                for record in removed:
+                    if record.get("kind") == "chain":
+                        chain = record["chain"]
+                        if _chain_current_rules("filter", chain) is None:
+                            run(["iptables", "-w", "-t", "filter", "-N", chain])
+                    else:
+                        table, chain, spec = record["table"], record["chain"], record["spec"]
+                        if run(iptables_spec(table, chain, spec, "-C"), check=False).returncode:
+                            operation = "-I" if record.get("insert") else "-A"
+                            params = ["1"] if record.get("insert") else []
+                            run(["iptables", "-w", "-t", table, operation, chain] + params + spec)
+            except Exception as rollback_exc:
+                issues.append(str(rollback_exc))
         raise GreError(f"Live NAT update failed on {name}: {exc}; rollback issues: {issues or 'none'}") from exc
     return True
+
+
+def bulk_security_plan(targets, mode):
+    if mode not in ("isolated", "isolated-pass", "legacy"):
+        raise GreError("Firewall mode must be isolated, isolated-pass or legacy")
+    targets = list(targets)
+    if not targets or len(set(targets)) != len(targets):
+        raise GreError("Select one or more unique managed GRE tunnels")
+    before, after = {}, {}
+    for name in targets:
+        c=load(name)
+        if c["firewall_mode"] != mode:
+            before[name]=c
+            after[name]=validate(dict(c,firewall_mode=mode))
+    return before, after
+
+
+def bulk_security(targets, mode, apply=False):
+    """Mass change firewall policy. Live --apply needs systemd GRE restart."""
+    old, updated = bulk_security_plan(targets, mode)
+    if not updated:
+        return {"changed":[], "restarted":[], "backup":None}
+    active_before = [n for n in updated if active(n)]
+    backup=safety_backup("before-bulk-security")
+    restarted=[]
+    try:
+        for cfg in updated.values():
+            save(cfg)
+        if apply:
+            for n in active_before:
+                run(["systemctl","restart",unit(n)])
+                restarted.append(n)
+    except Exception as e:
+        issues=[]
+        for cfg in old.values():
+            try: save(cfg)
+            except Exception as err: issues.append(str(err))
+        for n in active_before if apply else []:
+            try: run(["systemctl","restart",unit(n)])
+            except Exception as err: issues.append(str(err))
+        raise GreError(f"Bulk security change failed: {e}; rollback problems: {issues}") from e
+    return {"changed":sorted(updated), "restarted":restarted, "backup":backup,
+            "pending_restart":sorted(set(updated)-set(restarted))}
+
+
+def bulk_security_ui():
+    tunnel_names=names()
+    if not tunnel_names:
+        msg("No managed tunnels")
+        return
+    mode=menu("Bulk GRE firewall isolation", "Select security mode for managed GRE",[
+        ("isolated","ISOLATED: accept allowed traffic, drop other forwarding"),
+        ("isolated-pass","ISOLATED-PASS: honor downstream GRE-FORWARD policies"),
+        ("legacy","LEGACY: compatibility mode (not isolated)"),
+    ])
+    if not mode:
+        return
+    scope=menu("Bulk GRE isolation scope", "Which tunnels?",[
+        ("all","ALL managed tunnels"),("select","Specific tunnels (checkboxes)")])
+    if not scope:
+        return
+    targets=tunnel_names if scope=="all" else select_tunnels_checklist(tunnel_names)
+    if not targets:
+        return
+    old, changes=bulk_security_plan(targets,mode)
+    textbox("Firewall isolation PREVIEW", "\n".join(
+        [f"Change {len(changes)} of {len(targets)} GRE to {mode}:"]+
+        [f"{n}: {old[n]['firewall_mode']} -> {mode}; ACTIVE={active(n)}" for n in changes]+
+        ["", "Changes saved to JSON only until restart. --apply will restart GRE!",
+         "For existing old firewall rules, run audit before cutover."]))
+    if not changes or not confirm("Save firewall mode for selected GRE? A ZIP backup is created."):
+        return
+    live=any(active(n) for n in changes)
+    apply=live and confirm("RESTART affected ACTIVE GRE now? Traffic/SSH over these links WILL DROP briefly.")
+    msg(json.dumps(bulk_security(targets,mode,apply=apply),indent=2),"Security mode updated")
 
 
 def bulk_internet_plan(targets, turn_on, wan=""):
@@ -1763,6 +2548,63 @@ def bulk_internet_ui():
     msg(json.dumps(result, ensure_ascii=False, indent=2), "Bulk NAT complete")
 
 
+def acl_ui():
+    action=menu("GRE protocol-47 INPUT ACL", "Advanced: only for exclusive underlay addresses", [
+        ("preview","Preview which remote GRE IPs may reach this public address"),
+        ("on","ENABLE managed INPUT protocol-47 ACL (advanced)"),
+        ("off","DISABLE managed INPUT protocol-47 ACL"),
+    ])
+    if action is None:
+        return
+    if action == "off":
+        if confirm("Disable GRE INPUT access restriction? This allows other firewall rules to decide."):
+            underlay_acl_disable()
+            msg("Optional GRE INPUT restriction disabled")
+        return
+    endpoint=input_prompt("GRE underlay local IPv4", "IPv4 assigned to this Linux host",outbound_ipv4())
+    if endpoint is None:
+        return
+    wan=input_prompt("GRE underlay WAN", "Physical WAN interface receiving GRE protocol 47",guess_wan())
+    if wan is None:
+        return
+    plan=underlay_acl_plan(endpoint,wan)
+    textbox("INPUT ACL preview", json.dumps(plan,indent=2))
+    if action == "on" and confirm("EXCLUSIVE WAN ADDRESS ONLY. Existing unknown GRE peers may lose access!\n"
+                                   "Enable this protocol-47 whitelist after reviewing the migration?",
+                                   "Final confirmation"):
+        underlay_acl_enable(endpoint,wan)
+        msg("GRE INPUT ACL enabled. Inspect systemctl status gre-manager-input-acl")
+
+
+def stage_ui():
+    candidates = [n for n in live_gre_inventory() if n not in names()]
+    if not candidates:
+        msg("No unmanaged kernel GRE interfaces were detected")
+        return
+    name = menu("Stage existing Linux GRE", "Read-only scan; select GRE to stage as a profile", [(n,n) for n in candidates])
+    if not name:
+        return
+    plan = staged_live_profile(name)
+    textbox("Migration preview (NO takeover)", json.dumps(plan, indent=2))
+    if confirm(f"Create INACTIVE profile for {name}?\n"
+               "Existing live GRE / old scripts stay untouched.\n"
+               "You must cut over ownership manually before starting new service."):
+        stage_live(name)
+        msg(f"Staged {name}. Do NOT start gre-manager@{name} until old owner stopped and "
+            "kernel interface removed. Configure NAT/security/routes before cutover.")
+
+
+def audit_ui():
+    pool = read_pool()
+    alloc = external_address_occupancy(pool)
+    report = firewall_audit()
+    inventory = sorted(live_gre_inventory())
+    report["address_pool"] = pool
+    report["occupied_networks"] = [(str(net), evidence) for net,evidence in alloc]
+    report["unmanaged_gre"] = [name for name in inventory if name not in names()]
+    textbox("GRE / IP / firewall audit", json.dumps(report, indent=2))
+
+
 def help_ui():
     msg("MAIN MENU:\n"
         "- Create a GRE profile; then select its name below to manage it.\n"
@@ -1801,6 +2643,10 @@ def ui():
             ("@restore", "Restore tunnels from ZIP (another server)"),
             ("@bulk", "Bulk update local IPv4 in GRE tunnels"),
             ("@internet", "Bulk Internet/NAT: enable/disable ALL or selected GRE"),
+            ("@security", "Bulk GRE firewall isolation: ALL or selected"),
+            ("@audit", "Host audit: GRE addresses, legacy firewall, conflicts"),
+            ("@stage", "Stage existing Linux GRE profiles (NO takeover)"),
+            ("@acl", "GRE public-underlay INPUT ACL (advanced, opt-in)"),
             ("@pool", "GRE client /30 address pool"),
             ("@net", "Host network: public/local IP, interfaces, routes, rules"),
             ("@gre", "Show all kernel GRE/IP tunnels (read-only)"),
@@ -1830,6 +2676,14 @@ def ui():
             safe(bulk_local_ui)
         elif choice == "@internet":
             safe(bulk_internet_ui)
+        elif choice == "@security":
+            safe(bulk_security_ui)
+        elif choice == "@audit":
+            safe(audit_ui)
+        elif choice == "@stage":
+            safe(stage_ui)
+        elif choice == "@acl":
+            safe(acl_ui)
         elif choice == "@pool":
             safe(pool_ui)
         elif choice == "@net":
@@ -1850,6 +2704,14 @@ Usage:
   sudo gre-manager init                  # install systemd unit
   sudo gre-manager backup /root/gre.zip  # save all managed GRE tunnels
   sudo gre-manager pool [NEW_POOL_CIDR]     # show/change GRE /30 allocation pool
+  sudo gre-manager audit                     # readonly legacy firewall / address audit
+  sudo gre-manager acl preview --local IPV4 --wan ens3
+  sudo gre-manager acl enable --local IPV4 --wan ens3 --exclusive-underlay --commit
+  sudo gre-manager acl disable --commit
+  sudo gre-manager acl reconcile             # update allowed peers / restored INPUT hook
+  sudo gre-manager stage-live NAME [--commit] # preview or stage existing Linux GRE
+  sudo gre-manager firewall-reconcile NAME  # restore missing owned iptables rules
+  sudo gre-manager bulk-security --mode isolated --all [--commit] [--apply]
   sudo gre-manager allocate [POOL_CIDR]    # preview next free server/client /30
   sudo gre-manager peer TUNNEL             # RouterOS GRE IP/route instructions
   sudo gre-manager internet TUNNEL         # show NAT/forwarding status and config
@@ -1879,6 +2741,70 @@ Automatic pre-change ZIP backups go to /var/backups/gre-manager.
         (up if op == "_up" else down)(sys.argv[2])
     elif op == "ui" and len(sys.argv) == 1:
         ui()
+    elif op == "acl":
+        parser = argparse.ArgumentParser(prog="gre-manager acl")
+        parser.add_argument("action", choices=["preview", "enable", "disable", "reconcile"])
+        parser.add_argument("--local", default="")
+        parser.add_argument("--wan", default="")
+        parser.add_argument("--exclusive-underlay", action="store_true")
+        parser.add_argument("--commit", action="store_true")
+        args=parser.parse_args(sys.argv[2:])
+        if args.action == "preview":
+            print(json.dumps(underlay_acl_plan(args.local,args.wan),indent=2))
+        elif args.action == "enable":
+            if not (args.commit and args.exclusive_underlay):
+                raise GreError("Enable requires --commit --exclusive-underlay, and verified dedicated underlay")
+            print(json.dumps(underlay_acl_enable(args.local,args.wan),indent=2))
+        elif args.action == "reconcile":
+            if not args.commit:
+                raise GreError("Reconcile requires --commit")
+            print(json.dumps(underlay_acl_reconcile(),indent=2))
+        else:
+            if not args.commit:
+                raise GreError("Disable requires --commit")
+            underlay_acl_disable()
+            print("Managed GRE protocol-47 INPUT ACL disabled")
+    elif op == "_acl_restore" and len(sys.argv) == 2:
+        underlay_acl_restore()
+    elif op == "_acl_clear" and len(sys.argv) == 2:
+        underlay_acl_clear()
+    elif op == "audit" and len(sys.argv) == 2:
+        report = firewall_audit()
+        pool = read_pool()
+        report["address_pool"] = pool
+        report["occupied_networks"] = [(str(net), why) for net, why in external_address_occupancy(pool)]
+        report["unmanaged_gre"] = sorted(set(live_gre_inventory()) - set(names()))
+        print(json.dumps(report, indent=2))
+    elif op == "bulk-security":
+        parser=argparse.ArgumentParser(prog="gre-manager bulk-security")
+        parser.add_argument("--mode",choices=["isolated","isolated-pass","legacy"],required=True)
+        group=parser.add_mutually_exclusive_group(required=True)
+        group.add_argument("--all",action="store_true")
+        group.add_argument("--tunnels",default="")
+        parser.add_argument("--commit",action="store_true")
+        parser.add_argument("--apply",action="store_true")
+        args=parser.parse_args(sys.argv[2:])
+        if args.apply and not args.commit:
+            raise GreError("--apply requires --commit")
+        targets=names() if args.all else [n.strip() for n in args.tunnels.split(",") if n.strip()]
+        old, updated=bulk_security_plan(targets,args.mode)
+        plan={"mode":"commit" if args.commit else "preview",
+              "target_firewall_mode":args.mode,"selected":targets,
+              "changes":{n:{"old":old[n]["firewall_mode"],
+                             "new":updated[n]["firewall_mode"],"active":active(n)}
+                         for n in updated}}
+        if args.commit:
+            plan["result"]=bulk_security(targets,args.mode,apply=args.apply)
+        print(json.dumps(plan,indent=2))
+    elif op == "stage-live":
+        parser = argparse.ArgumentParser(prog="gre-manager stage-live")
+        parser.add_argument("name")
+        parser.add_argument("--commit", action="store_true")
+        args = parser.parse_args(sys.argv[2:])
+        result = stage_live(args.name) if args.commit else staged_live_profile(args.name)
+        print(json.dumps({"mode": "commit" if args.commit else "preview", **result}, indent=2))
+    elif op == "firewall-reconcile" and len(sys.argv) == 3:
+        print(json.dumps(firewall_reconcile(sys.argv[2]), indent=2))
     elif op == "pool":
         if len(sys.argv) == 2:
             print(read_pool())

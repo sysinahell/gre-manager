@@ -2,13 +2,14 @@
 
 # 🛰️ GRE Manager
 
-**Terminal UI for IPv4 GRE tunnels, routes, NAT and backups on Debian / Ubuntu**
+**Terminal UI for IPv4 GRE tunnels, routes, NAT, firewall and backups on Debian / Ubuntu**
 
-[![Version](https://img.shields.io/badge/version-1.4.0-blue.svg)](#-whats-new-in-v14)
+[![Version](https://img.shields.io/badge/version-1.5.0-blue.svg)](#-whats-new-in-v15)
+[![Status](https://img.shields.io/badge/status-pre--production-orange.svg)](#-safety--limitations)
 [![Python](https://img.shields.io/badge/python-3.x-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/platform-Debian%20%7C%20Ubuntu-A81D33.svg?logo=debian&logoColor=white)](#-installation)
-[![Tests](https://img.shields.io/badge/unit%20tests-42-success.svg)](test_gre_manager.py)
-[![MikroTik](https://img.shields.io/badge/peer-MikroTik%20RouterOS-293239.svg)](#-example-new-gre-to-mikrotik)
+[![Tests](https://img.shields.io/badge/unit%20tests-57-success.svg)](#-testing)
+[![MikroTik](https://img.shields.io/badge/peer-MikroTik%20RouterOS-293239.svg)](#-new-gre-to-mikrotik)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 
 **English** · [Русский](README.ru.md)
@@ -17,18 +18,28 @@
 
 ---
 
-GRE Manager is a single-file Python + `dialog` TUI that runs comfortably over SSH. It manages GRE tunnels, routes, source-routing rules, backups, IP migration, per-tunnel Internet NAT and bulk firewall changes — and touches **only its own** GRE profiles stored in `/etc/gre-manager/tunnels/`.
+GRE Manager is a single-file Python + `dialog` TUI that runs comfortably over SSH. It manages L3 GRE tunnels, routes, source routing, per-tunnel Internet NAT, firewall isolation, backups and IP migration — and touches **only its own** profiles in `/etc/gre-manager/tunnels/`.
+
+Requires Python 3, `dialog`, `iproute2`, systemd and `iptables` (legacy or iptables-nft). GRETAP, IPv6 GRE, IPsec and GRE encryption are **not** supported.
+
+> [!CAUTION]
+> **Pre-production release.** Unit tests use mocks and fixtures; they don't replace a test run in a disposable Debian/Ubuntu VM against a real MikroTik. Never restart tunnel services over their only SSH connection without console / rescue access.
 
 ## 📑 Contents
 
 - [Features](#-features)
-- [What's new in v1.4](#-whats-new-in-v14)
+- [What's new in v1.5](#-whats-new-in-v15)
 - [Installation](#-installation)
-- [Example: new GRE to MikroTik](#-example-new-gre-to-mikrotik)
-- [TUI: bulk NAT on/off](#-tui-bulk-nat-onoff)
+- [New GRE to MikroTik](#-new-gre-to-mikrotik)
+- [Firewall modes](#-firewall-modes)
+- [Read-only host audit](#-read-only-host-audit)
+- [Migrating existing GRE](#-migrating-existing-gre--two-phase-handover)
+- [Bulk NAT & security](#-bulk-nat--security-mode)
+- [Protocol-47 ingress ACL](#-optional-protocol-47-ingress-acl)
+- [Firewall persistence](#-firewall-persistence--reconciliation)
+- [Backups & IP migration](#-backups--ip-migration)
 - [CLI reference](#-cli-reference)
-- [Verification](#-verification-on-the-linux-server)
-- [Restore & IP migration](#-restore-to-another-server--mass-change-local-ipv4)
+- [Verification](#-verification)
 - [Safety & limitations](#-safety--limitations)
 - [Testing](#-testing)
 - [License](#-license)
@@ -37,32 +48,39 @@ GRE Manager is a single-file Python + `dialog` TUI that runs comfortably over SS
 
 | | |
 |---|---|
-| 🧙 **Tunnel wizard** | Creates GRE with automatic `/30` allocation from a pool (default `10.255.10.0/24`) |
+| 🧙 **Tunnel wizard** | Creates GRE with automatic `/30` allocation that checks live kernel addresses and routes |
 | 🌐 **Internet sharing** | Per-tunnel NAT + forwarding, enabled by default for new tunnels |
-| 🔀 **Routing** | Return routes to LANs behind the peer, source-routing policy rules |
-| 📦 **Bulk operations** | Enable/disable NAT on all or selected tunnels, live, without restarting GRE |
-| 💾 **Backup / restore** | ZIP backups, automatic pre-change snapshots in `/var/backups/gre-manager/` |
-| 🚚 **Migration** | Restore onto another server and mass-change the local underlay IPv4 |
-| ⚙️ **systemd** | One `gre-manager@<tunnel>.service` instance per tunnel, optional autostart |
+| 🛡️ **Firewall isolation** | Dedicated `GMF_*` FORWARD chain per tunnel with explicit DROP |
+| 🔒 **Ingress ACL** | Optional protocol-47 whitelist of GRE peers on the underlay IP |
+| 🔎 **Audit** | Read-only report of legacy rules, address usage and unmanaged GRE |
+| 🔁 **Migration** | Stage existing Linux GRE into managed profiles without touching them |
+| 📦 **Bulk operations** | NAT and security mode for all or selected tunnels |
+| 💾 **Backup / restore** | ZIP backups, automatic pre-change snapshots |
+| ⚙️ **systemd** | One `gre-manager@<tunnel>.service` per tunnel, optional autostart |
 | 📟 **MikroTik hints** | Ready-to-paste RouterOS commands for the peer side |
 
-## 🆕 What's new in v1.4
+## 🆕 What's new in v1.5
 
-1. **NAT configured automatically for new GRE tunnels.** After you fill in the GRE endpoints, the wizard opens **Automatic Internet sharing** with `Enable Internet/NAT: yes` by default. The server WAN is suggested from the default Internet route, and the assigned `/30` GRE peer (`10.255.10.2/32`, etc.) is added to the allowed NAT sources. You can turn this off in the wizard.
-2. **LANs behind MikroTik.** Optional comma-separated subnets in the same wizard, e.g. `192.168.88.0/24,192.168.99.0/24`. They are added to the NAT source allowlist **and** to the server GRE profile as return routes via that GRE interface (effective when the tunnel starts). LANs can't be inferred from the server — enter them manually.
-3. **Start immediately.** After saving a new profile the wizard asks whether to enable autostart and start now. If yes, NAT / firewall / IP forwarding come up with the tunnel; if no, they're saved for the next start. A failed initial start disables autostart so a broken config doesn't keep retrying on reboot.
-4. **Bulk Internet/NAT menu**, available from the main menu even when some tunnels are stopped: `ENABLE` / `DISABLE` for `ALL` or a multi-select checklist of tunnels (space toggles), followed by preview → auto-backup → confirmation → optional live apply.
-5. **Live firewall switching.** NAT and forwarding rules can be toggled on running GRE **without restarting interfaces**. Rules are tracked per tunnel in `/run/gre-manager/`; on failure a best-effort rollback of configs and firewall rules is performed.
-6. Editing the server-side GRE `/30` address also updates the allowlisted peer `/32` if it matched the previous peer. Other client LANs are not rewritten.
-7. **Backward compatible.** Existing profiles and v1.2 / v1.3 backups keep working. Upgrading does **not** turn NAT on for existing profiles — use *Bulk Internet/NAT* to opt them in.
+| Issue in 1.4 | v1.5 handling | Notes |
+|---|---|---|
+| `KeyError: internet` when editing the suggested `/30` | **Fixed**, covered by a test | The client `/32` follows the `/30` actually chosen |
+| Existing Linux GRE weren't recognized | `stage-live` preview/staging + TUI | **No forced live takeover** — stop the old owner first |
+| Pool only checked manager JSON | Reads kernel IPv4 addresses, all route tables, managed profiles and `/etc/gre-peers.conf` | Fails closed if the kernel can't be queried |
+| Broad legacy ACCEPT / MASQUERADE bypassed the NAT toggle | Optional isolated FORWARD chain per GRE with terminal DROP | Old profiles stay `legacy` until changed |
+| Existing custom FORWARD policies could be bypassed | `isolated-pass`: approved traffic RETURNs to the parent FORWARD chain | Default for staged GRE; new GRE use `isolated` |
+| No restriction on who may send GRE | Optional protocol-47 INPUT ACL with peer whitelist + DROP | Explicit opt-in, single exclusive underlay scope |
+| `iptables-persistent` restored duplicates | Identical manager rules are adopted idempotently | `firewall-reconcile` / `acl reconcile` if a reload flushes them |
+| MTU 1476 / TTL 64 defaults | New GRE: **MTU 1400**, **TTL 250** | Existing profiles keep their values |
+| Interfaces with both `/24` and `/30` | `extra_addresses` support; migration reads all IPv4 addresses | Verify duplicate-address behavior on your kernel |
+| No bulk security change | `bulk-security` for all or selected tunnels | `--apply` **restarts** active GRE |
 
 ## 📥 Installation
 
 ### Dependencies
 
 ```bash
-sudo apt update
-sudo apt install -y python3 iproute2 iputils-ping dialog iptables procps
+sudo apt-get update
+sudo apt-get install -y python3 iproute2 dialog iptables iputils-ping procps
 ```
 
 ### Fresh install
@@ -71,41 +89,41 @@ sudo apt install -y python3 iproute2 iputils-ping dialog iptables procps
 git clone https://github.com/sysinahell/gre-manager.git
 cd gre-manager
 sudo install -m 0755 gre-manager.py /usr/local/sbin/gre-manager
-sudo gre-manager init   # installs the systemd unit
-sudo gre-manager        # launch the TUI
+sudo gre-manager init    # installs systemd units
+sudo gre-manager audit   # read-only host check
+sudo gre-manager         # launch the TUI
 ```
 
-### Upgrade from v1.3
+### Upgrade from v1.4
 
 ```bash
-# optional but recommended
-sudo gre-manager backup /root/gre-before-v14.zip
-
-sudo cp -a /usr/local/sbin/gre-manager /usr/local/sbin/gre-manager.v1.3.bak
+sudo gre-manager backup /root/gre-before-v15.zip
+sudo cp -a /usr/local/sbin/gre-manager /usr/local/sbin/gre-manager.v1.4.bak
 sudo install -m 0755 gre-manager.py /usr/local/sbin/gre-manager
+sudo gre-manager init
+sudo gre-manager audit
 sudo gre-manager
 ```
 
 > [!NOTE]
-> No need to restart networking or re-run `init` when replacing v1.3 — configurations are preserved.
+> `init` is required after upgrading: it creates the optional, **disabled-by-default** `gre-manager-input-acl.service`. It doesn't start or restart any GRE, and it won't overwrite a `gre-manager@.service` that differs from the known template.
+>
+> Replacing the Python file needs **no GRE restart**. Existing profiles stay `firewall_mode=legacy` until switched explicitly. Backups from v1.2–v1.4 remain readable.
 
-## 🧭 Example: new GRE to MikroTik
+## 🧭 New GRE to MikroTik
+
+Typical topology: LAN → **source NAT on MikroTik to the GRE inner IP** → GRE → per-peer MASQUERADE on the server → Internet.
 
 | Parameter | Value |
 |---|---|
-| Server underlay IPv4 | `203.0.113.10` |
-| MikroTik underlay IPv4 | `198.51.100.20` |
-| Server WAN interface | `ens3` |
-| GRE inner (server / MikroTik) | `10.255.10.1/30` / `10.255.10.2/30` |
+| Server inner GRE | `10.255.10.1/30` |
+| MikroTik inner GRE | `10.255.10.2/30` |
+| Defaults for new tunnels | MTU 1400, TTL 250, NAT on, `firewall_mode=isolated` |
 
-**TUI:** `Create GRE tunnel` → enter `local`, `remote`, inner `/30` → `Automatic Internet sharing` → keep NAT `yes`, WAN `ens3`, optionally MikroTik LAN `192.168.88.0/24`.
-
-The manager configures:
-
-- server GRE address `10.255.10.1/30`;
-- NAT allowlist `10.255.10.2/32` and (if supplied) `192.168.88.0/24`;
-- return route `192.168.88.0/24 dev gre1` (if a LAN was supplied);
-- IPv4 forwarding and per-GRE iptables rules at service start.
+- When MikroTik does the first NAT, **leave the MikroTik LANs field empty** in the wizard — the peer `/32` is allowed automatically and no return routes are needed.
+- If LANs are routed without NAT, list them in the wizard: they're added to the NAT allowlist and as return routes via the GRE interface.
+- The server WAN is auto-detected — double-check it on multihomed hosts.
+- GRE (protocol 47) must be permitted in your existing INPUT firewall, unless you enable the [ingress ACL](#-optional-protocol-47-ingress-acl).
 
 **On MikroTik:**
 
@@ -114,122 +132,178 @@ The manager configures:
 ```
 
 > [!IMPORTANT]
-> Keep the route to the server's **public underlay IP** outside the GRE tunnel. To reach the Internet from MikroTik/LAN through GRE, point routes / routing policy on MikroTik at the server's **inner GRE IP** (e.g. `10.255.10.1`). RouterOS is not configured automatically — `sudo gre-manager peer gre1` prints suggested commands.
+> Keep the route to the server's **public underlay IP** outside the tunnel. RouterOS isn't configured automatically — `sudo gre-manager peer gre1` prints suggested commands.
 
-## 📋 TUI: bulk NAT on/off
+## 🛡️ Firewall modes
 
-From the main menu:
+| Mode | Behavior | Use for |
+|---|---|---|
+| `isolated` | Allows only listed sources to/from the selected WAN, drops all other FORWARD traffic of this GRE, adds source-scoped MASQUERADE | New tunnels (default) |
+| `isolated-pass` | Allowed flows RETURN to the parent `FORWARD` chain so existing policies still decide | Coexistence with an existing firewall; default for staged GRE |
+| `legacy` | Only manager NAT/FORWARD rules, no deny guard | Profiles from v1.4 and earlier |
 
-```text
-Bulk Internet/NAT: enable/disable ALL or selected GRE
-    ENABLE  Internet NAT/forwarding
-    DISABLE Internet NAT/forwarding
+New tunnels install their isolated guard **before** the GRE device comes up and remove it **after** it goes down, closing the window where a legacy `gre+ ACCEPT` could pass traffic.
 
-    ALL managed GRE tunnels
-    Select specific GRE tunnels using checkboxes
-         [ ] gre1
-         [ ] gre2
-         [ ] gre3
+> [!WARNING]
+> On a fresh VPS with default FORWARD DROP, `isolated-pass` may need extra downstream ACCEPT rules. Other tools can later reorder FORWARD — run `audit` to check.
+
+## 🔎 Read-only host audit
+
+```bash
+sudo gre-manager audit
 ```
 
-- When **enabling**, you may enter a common WAN override, or leave it blank to keep each tunnel's saved WAN (auto-detected if none).
-- The preview lists every affected tunnel and any client-LAN routes still missing.
-- Saving creates a backup in `/var/backups/gre-manager/`; active tunnels can be updated live, stopped ones pick up settings on next start.
-- When **disabling**, tunnels and routes stay up. Recorded firewall rules are removed, but global IPv4 forwarding and its sysctl file are **left in place**, since other services may rely on them.
+Reports security mode and state of managed tunnels, legacy `gre+ ACCEPT`, non-manager MASQUERADE, gaps in manager chains/hooks, `/30` pool occupancy (kernel addresses + all routes + `/etc/gre-peers.conf`) and unmanaged kernel GRE. It **does not** parse arbitrary shell scripts or custom registries — review those manually.
+
+Address conflict checks are strict: if an existing `/24` route or interface overlaps a proposed `/30`, the new tunnel is refused. Investigate rather than override.
+
+## 🔁 Migrating existing GRE — two-phase handover
+
+**1. Read-only scan and staging**
+
+```bash
+sudo gre-manager audit
+sudo gre-manager stage-live gre-shop3           # preview only
+sudo gre-manager stage-live gre-shop3 --commit  # create inactive profile, NEVER stops GRE
+```
+
+The preview reads live `ip -d -j link` parameters, all IPv4 addresses and non-connected routes via that GRE. The staged profile gets `internet.enabled=false`, `firewall_mode=isolated-pass` and no automatically attributed `ip rule`s. Complex definitions (wildcard remotes, asymmetric keys, unsupported parameters) are refused.
+
+Before cutover, save existing policy routing, `iptables-save`, the original service / crontab and any legacy registry, and review the staged profile (addresses, keys, MTU, TTL, routes, WAN, NAT sources).
+
+**2. Planned cutover** — only with console / rescue access:
+
+1. Stop and disable the **old** owner and any auto-recreation; make sure it doesn't come back.
+2. Delete the old kernel GRE interface.
+3. `systemctl enable --now gre-manager@gre-shop3.service`.
+4. Verify routes, packet captures and outbound NAT on both sides.
+
+> [!WARNING]
+> Never let an old script and the manager own the same interface at once. Broad legacy INPUT/FORWARD/NAT rules aren't removed automatically — plan that as a separate change. Migrate one test tunnel first; prefer `isolated-pass` until existing FORWARD checks are proven to still run.
+
+## 📦 Bulk NAT & security mode
+
+```bash
+# Read-only previews until --commit
+sudo gre-manager bulk-internet --enable --all --wan ens3
+sudo gre-manager bulk-internet --disable --tunnels gre1,gre3
+
+# NAT: firewall updated live, no GRE restart
+sudo gre-manager bulk-internet --disable --tunnels gre1,gre3 --commit --apply
+
+# Security mode: preview / save without restart
+sudo gre-manager bulk-security --mode isolated-pass --tunnels gre1,gre2
+sudo gre-manager bulk-security --mode isolated-pass --all --commit
+
+# CAUTION: restarts active GRE (SSH may drop)
+sudo gre-manager bulk-security --mode isolated-pass --all --commit --apply
+```
+
+In `isolated` / `isolated-pass`, turning NAT off keeps the manager's FORWARD deny guards. In `legacy`, it only removes manager rules — old broad ACCEPT/MASQUERADE may still pass traffic. `ip_forward` is global and is intentionally **never** auto-disabled.
+
+## 🔒 Optional protocol-47 ingress ACL
+
+**Not enabled on upgrade or migration.** Enable only on an **exclusive** underlay address after verifying that **all** live GRE on that IP are manager-owned. The ACL scopes `INPUT -i WAN -d LOCAL -p 47`, RETURNs known peer sources and DROPs all others.
+
+```bash
+sudo gre-manager acl preview --local 203.0.113.5 --wan ens3
+sudo gre-manager acl enable  --local 203.0.113.5 --wan ens3 --exclusive-underlay --commit
+sudo systemctl status gre-manager-input-acl.service
+
+# after changing the peer list or an iptables reload
+sudo gre-manager acl reconcile --commit
+
+# remove only the manager's ACL
+sudo gre-manager acl disable --commit
+```
+
+- One managed underlay scope per host. Activation is refused if an unmanaged or staged GRE is bound to that IP.
+- Behind NAT, use the **server-assigned** local IP, not the public NAT address.
+- Source-IP whitelisting is not authentication, integrity or encryption; approved packets still pass through your existing INPUT rules.
+
+## 🧱 Firewall persistence & reconciliation
+
+Manager rules use exact comments and dedicated `GMF_*` per-tunnel chains. If `netfilter-persistent` restores **identical** rules before the tunnel service starts, they're adopted without duplicates. If a later reload flushes them, the manager won't notice on its own:
+
+```bash
+sudo gre-manager audit
+sudo gre-manager firewall-reconcile gre1
+sudo gre-manager acl reconcile --commit   # only if the ingress ACL is on
+```
+
+`systemctl is-active` doesn't prove the firewall is correct. Reconciliation refuses externally modified manager chains, and no background timer is installed to avoid racing other firewall tools. In production pick **one firewall authority** and order reloads deliberately (netfilter-persistent / Docker / nftables / this manager).
+
+## 💾 Backups & IP migration
+
+```bash
+sudo gre-manager backup /root/gre-export.zip
+sudo gre-manager restore /root/gre-export.zip --local NEW_LOCAL --wan ens3
+sudo gre-manager restore /root/gre-export.zip --local NEW_LOCAL --wan ens3 --enable-saved --commit
+
+sudo gre-manager bulk-local NEW_LOCAL --from OLD_LOCAL
+sudo gre-manager bulk-local NEW_LOCAL --from OLD_LOCAL --commit --apply
+```
+
+- `restore` **never** starts tunnels; `bulk-local --apply` **restarts** active GRE.
+- Backups contain only manager profiles and enabled flags — **not** unmanaged tunnels, the global firewall, Docker, custom scripts / units or the ingress ACL. Migrate those separately.
 
 ## 💻 CLI reference
 
 ```text
-sudo gre-manager                         # interactive TUI
-sudo gre-manager --help                  # usage
-sudo gre-manager init                    # install systemd unit
-sudo gre-manager backup /root/gre.zip    # save all managed GRE tunnels
-sudo gre-manager pool [NEW_POOL_CIDR]    # show/change GRE /30 allocation pool
-sudo gre-manager allocate [POOL_CIDR]    # preview next free server/client /30
-sudo gre-manager peer TUNNEL             # RouterOS GRE IP/route instructions
-sudo gre-manager internet TUNNEL         # show NAT/forwarding status
+sudo gre-manager                                   # interactive TUI
+sudo gre-manager --help                            # usage
+sudo gre-manager init                              # install systemd units
+sudo gre-manager audit                             # read-only firewall / address audit
+sudo gre-manager pool [NEW_POOL_CIDR]              # show/change /30 allocation pool
+sudo gre-manager allocate [POOL_CIDR]              # preview next free /30
+sudo gre-manager peer TUNNEL                       # RouterOS instructions
+sudo gre-manager internet TUNNEL [--enable|--disable] [--wan WAN] [--sources CIDRs] [--commit] [--apply]
+sudo gre-manager bulk-internet --enable|--disable --all|--tunnels A,B [--wan WAN] [--commit] [--apply]
+sudo gre-manager bulk-security --mode MODE --all|--tunnels A,B [--commit] [--apply]
+sudo gre-manager stage-live NAME [--commit]        # stage an existing Linux GRE
+sudo gre-manager firewall-reconcile NAME           # restore missing owned rules
+sudo gre-manager acl preview|enable|disable|reconcile [...]
+sudo gre-manager backup FILE.zip
+sudo gre-manager restore FILE.zip [--local IPv4] [--replace] [--enable-saved] [--wan WAN] [--commit]
+sudo gre-manager bulk-local NEW_IP [--from OLD_IP] [--allow-unassigned] [--commit] [--apply]
 ```
 
 > [!TIP]
-> `restore`, `bulk-local`, `internet` and `bulk-internet` are **preview-only** unless `--commit` is given.
+> Every state-changing command is **preview-only** until `--commit`.
 
-### Bulk Internet NAT
-
-```bash
-# Preview only — changes nothing
-sudo gre-manager bulk-internet --enable --all --wan ens3
-sudo gre-manager bulk-internet --disable --tunnels gre1,gre3
-
-# Commit and apply firewall rules immediately, without restarting GRE
-sudo gre-manager bulk-internet --enable --all --wan ens3 --commit --apply
-sudo gre-manager bulk-internet --disable --tunnels gre1,gre3 --commit --apply
-
-# Save for the next service start/restart (no --apply)
-sudo gre-manager bulk-internet --enable --tunnels gre1,gre2 --commit
-```
-
-> [!WARNING]
-> For profiles that are already enabled, repeating `--enable --apply` with unchanged settings is a no-op. To apply staged changes, restart the GRE service or make an explicit setting change. In the TUI, choose live apply at the first commit for active tunnels.
-
-### Single tunnel
+## 🔍 Verification
 
 ```bash
-sudo gre-manager internet gre1 --enable --wan ens3 \
-  --sources 10.255.10.2/32,192.168.88.0/24 --commit --apply
-```
-
-For older profiles, make sure a route back to `192.168.88.0/24` via the GRE interface exists — bulk-enabling NAT doesn't add LAN routes to old profiles (the new-tunnel wizard does).
-
-## 🔍 Verification on the Linux server
-
-```bash
-# GRE / link / routing state
-ip -br -4 addr show
-ip -4 route show
+ip -br -4 addr
 ip -d tunnel show
-
-# IPv4 forwarding
-sysctl net.ipv4.ip_forward
-
-# NAT / FORWARD rules created by GRE Manager
-sudo iptables -t nat -S POSTROUTING | grep gre-manager
-sudo iptables -S FORWARD | grep gre-manager
-
-# Service of tunnel gre1
+ip -4 route show table all
+ip -4 rule show
+sudo iptables -S FORWARD
+sudo iptables -t nat -S POSTROUTING
+sudo iptables -S INPUT
 sudo systemctl status gre-manager@gre1.service
 sudo journalctl -u gre-manager@gre1.service -n 60 --no-pager
-sudo gre-manager peer gre1
 ```
 
-On MikroTik, check addresses and routes separately. `ping 10.255.10.1` from the router is the first check before routing LAN Internet traffic.
-
-## 🚚 Restore to another server & mass-change local IPv4
-
-```bash
-sudo gre-manager backup /root/all-gre.zip
-sudo gre-manager restore /root/all-gre.zip --local NEW_LOCAL_IP --wan ens3 --enable-saved --commit
-sudo gre-manager bulk-local NEW_LOCAL_IP --from OLD_LOCAL_IP --commit --apply
-```
-
-- `restore` **never** starts tunnels, even when it restores autostart flags.
-- `bulk-local --apply` **does** restart active GRE and may drop your SSH session.
+On MikroTik, `ping 10.255.10.1` is the first check before routing LAN traffic.
 
 ## 🚧 Safety & limitations
 
-- GRE is **IPv4 protocol 47**, not TCP/UDP port 47. Server and hosting firewalls must allow protocol 47 between the underlay peers. GRE is **not encrypted**.
-- The NAT allowlist is bound to configured source CIDRs and the WAN device. **FORWARD** rules match the GRE input interface; **MASQUERADE** rules in `POSTROUTING` match source CIDR + WAN output (iptables doesn't allow `-i` there), so avoid overlapping client subnets and conflicting NAT rules. An unrestricted `0.0.0.0/0` source is **never** added.
-- Other firewall layers (`nftables` base chains, UFW / firewalld, Docker, cloud security groups) can affect traffic — test real packet flow, not just rule presence.
-- `net.ipv4.ip_forward=1` is persisted once NAT is enabled and is **not** reset when all NAT is disabled.
-- Live changes touch only rules recorded by this manager and never flush chains. Rollback is **best-effort**, not a network transaction — keep console / out-of-band access.
-- GRE devices managed by Netplan / NetworkManager / ifupdown are neither imported nor modified.
+- GRE is **IPv4 protocol 47**, not TCP/UDP port 47, and it's **not encrypted**. Hosting/cloud firewalls must allow protocol 47 between underlay peers.
+- MASQUERADE is matched by source CIDR + WAN output — avoid overlapping client subnets. An unrestricted `0.0.0.0/0` source is **never** added.
+- Other layers (nftables base chains, UFW / firewalld, Docker, cloud security groups, reverse-path filtering) affect traffic — test real packet flow.
+- Live changes only touch rules recorded by the manager and never flush chains. Rollback is **best-effort** — keep console / out-of-band access.
+- GRE devices owned by Netplan / NetworkManager / ifupdown are not modified; existing ones can be brought under management only via `stage-live`.
+- Validate duplicate inner prefixes, iptables-nft chains, Docker ordering, rp_filter and provider protocol-47 filtering in a disposable VM before production cutover.
 
 ## 🧪 Testing
 
 ```bash
-python3 -m unittest -v test_gre_manager.py
+python3 -m py_compile gre-manager.py
+sudo python3 -m unittest -v test_gre_manager.py test_v15.py
 ```
 
-The script and its 42 unit tests have been verified syntactically and with mocks. A full end-to-end test on a real Debian/Ubuntu host with GRE and firewall has **not** been performed yet — please test in a safe environment first.
+57 unit tests based on mocks / fixtures for iproute2, iptables and systemd. CLI tests need root (`sudo`). Live network-namespace / integration tests have **not** been run.
 
 ## 📂 Files
 
@@ -238,7 +312,10 @@ The script and its 42 unit tests have been verified syntactically and with mocks
 | `/usr/local/sbin/gre-manager` | Installed script |
 | `/etc/gre-manager/tunnels/` | Managed GRE profiles |
 | `/etc/gre-manager/settings.json` | Global settings (allocation pool) |
-| `/etc/systemd/system/gre-manager@.service` | systemd template unit |
+| `/etc/gre-manager/gre-input-acl.json` | Ingress ACL configuration |
+| `/etc/gre-peers.conf` | Legacy peer registry (read-only, used for allocation) |
+| `/etc/systemd/system/gre-manager@.service` | Per-tunnel template unit |
+| `/etc/systemd/system/gre-manager-input-acl.service` | Ingress ACL unit (disabled by default) |
 | `/etc/sysctl.d/90-gre-manager-forward.conf` | Persistent IPv4 forwarding |
 | `/run/gre-manager/` | Runtime state, applied firewall rules |
 | `/var/backups/gre-manager/` | Automatic pre-change backups |
