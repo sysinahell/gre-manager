@@ -169,7 +169,7 @@ The script creates the GRE interface (keepalive off, MTU from the profile), its 
 
 Every object is tagged `comment="gre-manager:<tunnel>"`; uninstall commands are at the end of the script.
 
-## 🛡️ Firewall modes
+## 🚦 Firewall modes
 
 | Mode | Behavior | Use for |
 |---|---|---|
