@@ -87,20 +87,28 @@ sudo apt-get install -y python3 iproute2 dialog iptables iputils-ping procps
 git clone https://github.com/sysinahell/gre-manager.git
 cd gre-manager
 sudo install -m 0755 gre-manager.py /usr/local/sbin/gre-manager
-sudo gre-manager init    # устанавливает systemd-юниты
-sudo gre-manager audit   # проверка хоста (только чтение)
-sudo gre-manager         # запуск TUI
+
+# установить systemd-юниты
+sudo gre-manager init
+
+# проверка хоста (только чтение)
+sudo gre-manager audit
+
+# запуск TUI
+sudo gre-manager
 ```
 
 ### Обновление с v1.4
 
 ```bash
+# бэкап профилей и старой версии скрипта
 sudo gre-manager backup /root/gre-before-v15.zip
-sudo cp -a /usr/local/sbin/gre-manager /usr/local/sbin/gre-manager.v1.4.bak
+sudo cp -a /usr/local/sbin/gre-manager /root/gre-manager.v1.4.bak
+
+# установка новой версии
 sudo install -m 0755 gre-manager.py /usr/local/sbin/gre-manager
 sudo gre-manager init
 sudo gre-manager audit
-sudo gre-manager
 ```
 
 > [!NOTE]
@@ -123,22 +131,30 @@ sudo gre-manager
 - WAN сервера определяется автоматически — на хостах с несколькими аплинками проверьте его.
 - GRE (протокол 47) должен быть разрешён в вашем INPUT, если вы не включаете [входящий ACL](#-опциональный-acl-входящего-протокола-47).
 
-**На MikroTik:**
+Конфиг для MikroTik генерируется целиком — см. [следующий раздел](#полный-скрипт-для-mikrotik-routeros-6--7). Краткая сводка по туннелю (адреса, NAT, недостающие маршруты):
 
-```routeros
-/ip address add address=10.255.10.2/30 interface=GRE_NAME
+```bash
+sudo gre-manager peer gre1
 ```
-
-> [!IMPORTANT]
-> Маршрут до **публичного underlay IP** сервера должен идти мимо туннеля. RouterOS автоматически не настраивается — `sudo gre-manager peer gre1` выводит рекомендуемые команды.
 
 ### Полный скрипт для MikroTik (RouterOS 6 / 7)
 
 TUI: меню туннеля → `Generate full MikroTik script`. Результат можно вывести простым текстом для копирования мышью (без рамок dialog), отправить сразу в локальный буфер обмена через OSC 52 (Windows Terminal, iTerm2, kitty, WezTerm; в tmux нужен `set -g set-clipboard on`), сохранить в `.rsc` или посмотреть в окне. Или через CLI:
 
 ```bash
-sudo gre-manager mikrotik gre1 --ros 7 --clients 192.168.88.10,192.168.88.0/24
-sudo gre-manager mikrotik gre1 --ros 6 --clients 192.168.88.10 -o /root/gre1.rsc
+# RouterOS 7: вывести скрипт на экран
+sudo gre-manager mikrotik gre1 --ros 7 \
+    --clients 192.168.88.10,192.168.88.0/24
+
+# RouterOS 6: сохранить в файл для /import
+sudo gre-manager mikrotik gre1 --ros 6 \
+    --clients 192.168.88.10 -o /root/gre1.rsc
+```
+
+Готовый `.rsc` загрузите в **Files** на роутере и выполните:
+
+```text
+/import file-name=gre1.rsc
 ```
 
 Скрипт создаёт GRE-интерфейс (keepalive выключен, MTU из профиля), его адрес `/30`, отдельную таблицу маршрутизации (`/routing table` в v7, `routing-mark` в v6) с маршрутом по умолчанию через внутренний IP сервера и `check-gateway=ping`, address-list клиентов и список исключений для частных сетей, mangle (метка соединения → метка маршрута, MSS clamp), маскарад в туннель и исключает помеченные соединения из FastTrack. Через GRE идут только клиенты из списка; сам роутер и публичный адрес GRE-сервера остаются в основной таблице.
@@ -182,8 +198,12 @@ sudo gre-manager audit
 
 ```bash
 sudo gre-manager audit
-sudo gre-manager stage-live gre-shop3           # только предпросмотр
-sudo gre-manager stage-live gre-shop3 --commit  # создать неактивный профиль, GRE НИКОГДА не останавливается
+
+# только предпросмотр
+sudo gre-manager stage-live gre-shop3
+
+# создать неактивный профиль (сам GRE не останавливается)
+sudo gre-manager stage-live gre-shop3 --commit
 ```
 
 Предпросмотр читает живые параметры `ip -d -j link`, все IPv4-адреса и неподключённые маршруты через этот GRE. Профиль создаётся с `internet.enabled=false`, `firewall_mode=isolated-pass` и без автоматически привязанных `ip rule`. Сложные конфигурации (wildcard remote, асимметричные ключи, неподдерживаемые параметры) отклоняются.
@@ -194,7 +214,7 @@ sudo gre-manager stage-live gre-shop3 --commit  # создать неактив�
 
 1. Остановите и отключите **старого** владельца и любое автопересоздание; убедитесь, что он не поднимется снова.
 2. Удалите старый GRE-интерфейс в ядре.
-3. `systemctl enable --now gre-manager@gre-shop3.service`.
+3. Запустите туннель под управлением менеджера: `sudo systemctl enable --now gre-manager@gre-shop3.service`.
 4. Проверьте маршруты, захват пакетов и исходящий NAT с обеих сторон.
 
 > [!WARNING]
@@ -203,19 +223,25 @@ sudo gre-manager stage-live gre-shop3 --commit  # создать неактив�
 ## 📦 Массовые NAT и режим безопасности
 
 ```bash
-# Только предпросмотр, пока нет --commit
+# NAT, предпросмотр (без --commit ничего не меняется)
 sudo gre-manager bulk-internet --enable --all --wan ens3
 sudo gre-manager bulk-internet --disable --tunnels gre1,gre3
 
-# NAT: firewall обновляется «на лету», без перезапуска GRE
-sudo gre-manager bulk-internet --disable --tunnels gre1,gre3 --commit --apply
+# NAT, применить «на лету», без перезапуска GRE
+sudo gre-manager bulk-internet --disable --tunnels gre1,gre3 \
+    --commit --apply
+```
 
-# Режим безопасности: предпросмотр / сохранение без перезапуска
+```bash
+# режим безопасности, предпросмотр
 sudo gre-manager bulk-security --mode isolated-pass --tunnels gre1,gre2
+
+# сохранить без перезапуска (применится при следующем старте)
 sudo gre-manager bulk-security --mode isolated-pass --all --commit
 
-# ОСТОРОЖНО: перезапускает активные GRE (SSH может оборваться)
-sudo gre-manager bulk-security --mode isolated-pass --all --commit --apply
+# ОСТОРОЖНО: перезапускает активные GRE, SSH может оборваться
+sudo gre-manager bulk-security --mode isolated-pass --all \
+    --commit --apply
 ```
 
 В `isolated` / `isolated-pass` выключение NAT сохраняет запрещающие барьеры FORWARD. В `legacy` удаляются только правила менеджера — старые широкие ACCEPT/MASQUERADE могут продолжать пропускать трафик. `ip_forward` глобальный и намеренно **никогда** не выключается автоматически.
@@ -225,8 +251,12 @@ sudo gre-manager bulk-security --mode isolated-pass --all --commit --apply
 **Не включается при обновлении или миграции.** Включайте только на **эксклюзивном** underlay-адресе, убедившись, что **все** живые GRE на нём управляются менеджером. ACL ограничен `INPUT -i WAN -d LOCAL -p 47`: известные пиры пропускаются (RETURN), остальные отбрасываются (DROP).
 
 ```bash
+# предпросмотр
 sudo gre-manager acl preview --local 203.0.113.5 --wan ens3
-sudo gre-manager acl enable  --local 203.0.113.5 --wan ens3 --exclusive-underlay --commit
+
+# включить
+sudo gre-manager acl enable --local 203.0.113.5 --wan ens3 \
+    --exclusive-underlay --commit
 sudo systemctl status gre-manager-input-acl.service
 
 # после изменения списка пиров или перезагрузки iptables
@@ -247,7 +277,9 @@ sudo gre-manager acl disable --commit
 ```bash
 sudo gre-manager audit
 sudo gre-manager firewall-reconcile gre1
-sudo gre-manager acl reconcile --commit   # только если включён входящий ACL
+
+# только если включён входящий ACL
+sudo gre-manager acl reconcile --commit
 ```
 
 `systemctl is-active` не доказывает корректность firewall. Восстановление отказывается работать с цепочками менеджера, изменёнными извне, а фоновый таймер не ставится, чтобы не конкурировать с другими инструментами. В продакшене выберите **один источник правды для firewall** и осознанно упорядочьте перезагрузки (netfilter-persistent / Docker / nftables / этот менеджер).
@@ -255,12 +287,19 @@ sudo gre-manager acl reconcile --commit   # только если включён
 ## 💾 Бэкапы и миграция IP
 
 ```bash
+# на старом сервере
 sudo gre-manager backup /root/gre-export.zip
-sudo gre-manager restore /root/gre-export.zip --local NEW_LOCAL --wan ens3
-sudo gre-manager restore /root/gre-export.zip --local NEW_LOCAL --wan ens3 --enable-saved --commit
 
-sudo gre-manager bulk-local NEW_LOCAL --from OLD_LOCAL
-sudo gre-manager bulk-local NEW_LOCAL --from OLD_LOCAL --commit --apply
+# на новом сервере: предпросмотр, затем запись профилей
+sudo gre-manager restore /root/gre-export.zip --local 203.0.113.20 --wan ens3
+sudo gre-manager restore /root/gre-export.zip --local 203.0.113.20 --wan ens3 \
+    --enable-saved --commit
+```
+
+```bash
+# смена локального IPv4 у всех туннелей: предпросмотр, затем применение
+sudo gre-manager bulk-local 203.0.113.20 --from 203.0.113.10
+sudo gre-manager bulk-local 203.0.113.20 --from 203.0.113.10 --commit --apply
 ```
 
 - `restore` **никогда** не запускает туннели; `bulk-local --apply` **перезапускает** активные GRE.
@@ -268,25 +307,26 @@ sudo gre-manager bulk-local NEW_LOCAL --from OLD_LOCAL --commit --apply
 
 ## 💻 Справка по CLI
 
-```text
-sudo gre-manager                                   # интерактивный TUI
-sudo gre-manager --help                            # справка
-sudo gre-manager init                              # установить systemd-юниты
-sudo gre-manager audit                             # аудит firewall / адресов (только чтение)
-sudo gre-manager pool [NEW_POOL_CIDR]              # показать/изменить пул /30
-sudo gre-manager allocate [POOL_CIDR]              # предпросмотр следующего свободного /30
-sudo gre-manager peer TUNNEL                       # инструкции для RouterOS
-sudo gre-manager mikrotik TUNNEL [--ros 6|7] [--clients IPs] [--server-ip IPv4] [--fallback] [-o FILE]
-sudo gre-manager internet TUNNEL [--enable|--disable] [--wan WAN] [--sources CIDRs] [--commit] [--apply]
-sudo gre-manager bulk-internet --enable|--disable --all|--tunnels A,B [--wan WAN] [--commit] [--apply]
-sudo gre-manager bulk-security --mode MODE --all|--tunnels A,B [--commit] [--apply]
-sudo gre-manager stage-live NAME [--commit]        # перенести существующий Linux GRE
-sudo gre-manager firewall-reconcile NAME           # восстановить недостающие правила менеджера
-sudo gre-manager acl preview|enable|disable|reconcile [...]
-sudo gre-manager backup FILE.zip
-sudo gre-manager restore FILE.zip [--local IPv4] [--replace] [--enable-saved] [--wan WAN] [--commit]
-sudo gre-manager bulk-local NEW_IP [--from OLD_IP] [--allow-unassigned] [--commit] [--apply]
-```
+Все команды запускаются через `sudo`. Полная справка с ключами — `sudo gre-manager --help`.
+
+| Команда | Что делает |
+|---|---|
+| `gre-manager` | Интерактивный TUI |
+| `gre-manager init` | Установить systemd-юниты |
+| `gre-manager audit` | Аудит firewall и адресов (только чтение) |
+| `gre-manager pool [CIDR]` | Показать или изменить пул адресов `/30` |
+| `gre-manager allocate [CIDR]` | Показать следующую свободную пару `/30` |
+| `gre-manager peer TUNNEL` | Сводка по туннелю для стороны MikroTik |
+| `gre-manager mikrotik TUNNEL` | Полный скрипт для RouterOS 6 / 7 |
+| `gre-manager internet TUNNEL` | NAT одного туннеля |
+| `gre-manager bulk-internet` | NAT для всех или выбранных туннелей |
+| `gre-manager bulk-security` | Режим firewall для всех или выбранных туннелей |
+| `gre-manager stage-live NAME` | Взять под управление существующий Linux GRE |
+| `gre-manager firewall-reconcile NAME` | Восстановить пропавшие правила туннеля |
+| `gre-manager acl ACTION` | Входящий ACL: `preview`, `enable`, `disable`, `reconcile` |
+| `gre-manager backup FILE.zip` | Бэкап профилей |
+| `gre-manager restore FILE.zip` | Восстановление из бэкапа |
+| `gre-manager bulk-local NEW_IP` | Сменить локальный IPv4 у туннелей |
 
 > [!TIP]
 > Любая изменяющая команда работает **только в режиме предпросмотра**, пока не указан `--commit`.
