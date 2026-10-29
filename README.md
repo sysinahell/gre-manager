@@ -322,7 +322,7 @@ sudo journalctl -u gre-manager@gre1.service -n 60 --no-pager
 
 ```bash
 python3 -m py_compile gre-manager.py
-sudo python3 -m unittest -v test_gre_manager.py test_v15.py
+sudo python3 -m unittest discover -s tests -v
 ```
 
 62 юнит-теста на моках / фикстурах для iproute2, iptables и systemd. Тестам CLI нужен root (`sudo`). Живые интеграционные тесты в network namespace **не** проводились.

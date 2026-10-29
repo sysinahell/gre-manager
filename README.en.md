@@ -322,7 +322,7 @@ On MikroTik, `ping 10.255.10.1` is the first check before routing LAN traffic.
 
 ```bash
 python3 -m py_compile gre-manager.py
-sudo python3 -m unittest -v test_gre_manager.py test_v15.py
+sudo python3 -m unittest discover -s tests -v
 ```
 
 62 unit tests based on mocks / fixtures for iproute2, iptables and systemd. CLI tests need root (`sudo`). Live network-namespace / integration tests have **not** been run.
