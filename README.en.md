@@ -8,7 +8,6 @@
 [![Status](https://img.shields.io/badge/status-pre--production-orange.svg)](#-safety--limitations)
 [![Python](https://img.shields.io/badge/python-3.x-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/platform-Debian%20%7C%20Ubuntu-A81D33.svg?logo=debian&logoColor=white)](#-installation)
-[![Tests](https://img.shields.io/badge/unit%20tests-62-success.svg)](#-testing)
 [![MikroTik](https://img.shields.io/badge/peer-MikroTik%20RouterOS-293239.svg)](#-new-gre-to-mikrotik)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 
@@ -23,7 +22,7 @@ GRE Manager is a single-file Python + `dialog` TUI that runs comfortably over SS
 Requires Python 3, `dialog`, `iproute2`, systemd and `iptables` (legacy or iptables-nft). GRETAP, IPv6 GRE, IPsec and GRE encryption are **not** supported.
 
 > [!CAUTION]
-> **Pre-production release.** Unit tests use mocks and fixtures; they don't replace a test run in a disposable Debian/Ubuntu VM against a real MikroTik. Never restart tunnel services over their only SSH connection without console / rescue access.
+> **Pre-production release.** It hasn't been integration-tested live — try it in a disposable Debian/Ubuntu VM against a real MikroTik first. Never restart tunnel services over their only SSH connection without console / rescue access.
 
 ## 📑 Contents
 
@@ -41,7 +40,6 @@ Requires Python 3, `dialog`, `iproute2`, systemd and `iptables` (legacy or iptab
 - [CLI reference](#-cli-reference)
 - [Verification](#-verification)
 - [Safety & limitations](#-safety--limitations)
-- [Testing](#-testing)
 - [License](#-license)
 
 ## ✨ Features
@@ -63,7 +61,7 @@ Requires Python 3, `dialog`, `iproute2`, systemd and `iptables` (legacy or iptab
 
 | Issue in 1.4 | v1.5 handling | Notes |
 |---|---|---|
-| `KeyError: internet` when editing the suggested `/30` | **Fixed**, covered by a test | The client `/32` follows the `/30` actually chosen |
+| `KeyError: internet` when editing the suggested `/30` | **Fixed** | The client `/32` follows the `/30` actually chosen |
 | Existing Linux GRE weren't recognized | `stage-live` preview/staging + TUI | **No forced live takeover** — stop the old owner first |
 | Pool only checked manager JSON | Reads kernel IPv4 addresses, all route tables, managed profiles and `/etc/gre-peers.conf` | Fails closed if the kernel can't be queried |
 | Broad legacy ACCEPT / MASQUERADE bypassed the NAT toggle | Optional isolated FORWARD chain per GRE with terminal DROP | Old profiles stay `legacy` until changed |
@@ -317,15 +315,6 @@ On MikroTik, `ping 10.255.10.1` is the first check before routing LAN traffic.
 - Live changes only touch rules recorded by the manager and never flush chains. Rollback is **best-effort** — keep console / out-of-band access.
 - GRE devices owned by Netplan / NetworkManager / ifupdown are not modified; existing ones can be brought under management only via `stage-live`.
 - Validate duplicate inner prefixes, iptables-nft chains, Docker ordering, rp_filter and provider protocol-47 filtering in a disposable VM before production cutover.
-
-## 🧪 Testing
-
-```bash
-python3 -m py_compile gre-manager.py
-sudo python3 -m unittest discover -s tests -v
-```
-
-62 unit tests based on mocks / fixtures for iproute2, iptables and systemd. CLI tests need root (`sudo`). Live network-namespace / integration tests have **not** been run.
 
 ## 📂 Files
 

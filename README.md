@@ -8,7 +8,6 @@
 [![Status](https://img.shields.io/badge/status-pre--production-orange.svg)](#-безопасность-и-ограничения)
 [![Python](https://img.shields.io/badge/python-3.x-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/platform-Debian%20%7C%20Ubuntu-A81D33.svg?logo=debian&logoColor=white)](#-установка)
-[![Tests](https://img.shields.io/badge/unit%20tests-62-success.svg)](#-тестирование)
 [![MikroTik](https://img.shields.io/badge/peer-MikroTik%20RouterOS-293239.svg)](#-новый-gre-до-mikrotik)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 
@@ -23,7 +22,7 @@ GRE Manager — это TUI в одном файле на Python + `dialog`, уд
 Нужны Python 3, `dialog`, `iproute2`, systemd и `iptables` (legacy или iptables-nft). GRETAP, IPv6 GRE, IPsec и шифрование GRE **не** поддерживаются.
 
 > [!CAUTION]
-> **Предрелизная версия.** Юнит-тесты построены на моках и фикстурах и не заменяют проверку на одноразовой ВМ с Debian/Ubuntu и реальным MikroTik. Не перезапускайте сервисы туннелей через единственное SSH-подключение без доступа к консоли / rescue.
+> **Предрелизная версия.** Живых интеграционных тестов не было — сначала проверьте на одноразовой ВМ с Debian/Ubuntu и реальным MikroTik. Не перезапускайте сервисы туннелей через единственное SSH-подключение без доступа к консоли / rescue.
 
 ## 📑 Содержание
 
@@ -41,7 +40,6 @@ GRE Manager — это TUI в одном файле на Python + `dialog`, уд
 - [Справка по CLI](#-справка-по-cli)
 - [Проверка](#-проверка)
 - [Безопасность и ограничения](#-безопасность-и-ограничения)
-- [Тестирование](#-тестирование)
 - [Лицензия](#-лицензия)
 
 ## ✨ Возможности
@@ -63,7 +61,7 @@ GRE Manager — это TUI в одном файле на Python + `dialog`, уд
 
 | Проблема в 1.4 | Решение в v1.5 | Примечание |
 |---|---|---|
-| `KeyError: internet` при редактировании предложенного `/30` | **Исправлено**, покрыто тестом | `/32` клиента берётся из реально выбранного `/30` |
+| `KeyError: internet` при редактировании предложенного `/30` | **Исправлено** | `/32` клиента берётся из реально выбранного `/30` |
 | Существующие Linux GRE не распознавались | Предпросмотр и staging через `stage-live` + TUI | **Без принудительного перехвата** — сначала остановите старого владельца |
 | Пул проверял только JSON менеджера | Читаются IPv4-адреса ядра, все таблицы маршрутов, профили и `/etc/gre-peers.conf` | Если ядро опросить не удалось — выделение запрещается |
 | Широкие старые ACCEPT / MASQUERADE обходили переключатель NAT | Опциональная изолированная цепочка FORWARD на каждый GRE с финальным DROP | Старые профили остаются `legacy`, пока их явно не переключат |
@@ -317,15 +315,6 @@ sudo journalctl -u gre-manager@gre1.service -n 60 --no-pager
 - Изменения «на лету» затрагивают только правила, учтённые менеджером, и никогда не очищают цепочки. Откат — **best-effort**: держите доступ к консоли / out-of-band.
 - GRE под управлением Netplan / NetworkManager / ifupdown не изменяются; существующие туннели можно взять под управление только через `stage-live`.
 - Перед переключением продакшена проверьте на одноразовой ВМ дублирующиеся внутренние префиксы, цепочки iptables-nft, порядок правил Docker, rp_filter и фильтрацию протокола 47 у провайдера.
-
-## 🧪 Тестирование
-
-```bash
-python3 -m py_compile gre-manager.py
-sudo python3 -m unittest discover -s tests -v
-```
-
-62 юнит-теста на моках / фикстурах для iproute2, iptables и systemd. Тестам CLI нужен root (`sudo`). Живые интеграционные тесты в network namespace **не** проводились.
 
 ## 📂 Файлы
 
